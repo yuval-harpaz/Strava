@@ -1,5 +1,6 @@
 import requests
 import os
+
 STRAVA_CLIENT_ID = os.environ['STRAVA_ID']
 STRAVA_CLIENT_SECRET = os.environ['STRAVA_SECRET']
 STRAVA_REFRESH_TOKEN = os.environ['STRAVA_REFRESH']
