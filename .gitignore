@@ -1,3 +1,4 @@
 .idea
 *.html
 */*.html
+code/__pycache__

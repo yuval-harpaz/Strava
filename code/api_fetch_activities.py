@@ -168,11 +168,13 @@ if to_download:
                             start_dt = None
 
                     # Build GPX content
+                    activity_type = activity.get('type', 'Run').lower()
                     gpx_lines = [
                         '<?xml version="1.0" encoding="UTF-8"?>',
                         '<gpx version="1.1" creator="Strava API streams fallback">',
                         '  <trk>',
                         f'    <name>{activity.get("name", activity_id)}</name>',
+                        f'    <type>{activity_type}</type>',
                         '    <trkseg>'
                     ]
 

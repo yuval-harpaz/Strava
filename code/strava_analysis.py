@@ -19,6 +19,12 @@ import numpy as np
 from sklearn.cluster import DBSCAN
 import plotly.graph_objects as go
 
+# Known issues
+bad = [18767282334, 18757050177, 18726249587, 18663603021, 18610526273, 18532370069, 18348237273, 18068507969,
+       17474314206, 17235917782, 16852683261, 15880099077, 15047930706, 14768519424, 14479333822, 14264064245,
+       19088581908, 18906815918, 14128647827, 13797004948, 13774752963]
+
+
 # ── GPX parsing ──────────────────────────────────────────────────────────────
 
 NS = {
@@ -43,23 +49,46 @@ def parse_gpx(path):
     root = tree.getroot()
 
     # Activity type
+    # Try to find a namespaced <trk> (official GPX) but accept non-namespaced
     trk = root.find('gpx:trk', NS)
+    use_ns = True
+    if trk is None:
+        trk = root.find('trk')
+        use_ns = False
     if trk is None:
         return None
-    typ = trk.findtext('gpx:type', default='', namespaces=NS).lower()
-    if 'run' not in typ:
+
+    # Read <type> and <name> with or without namespace. If type is missing,
+    # assume running (to support API-generated GPX built from streams).
+    if use_ns:
+        typ = trk.findtext('gpx:type', default='', namespaces=NS).lower()
+        name = trk.findtext('gpx:name', default=os.path.basename(path), namespaces=NS)
+    else:
+        typ = trk.findtext('type', default='').lower()
+        name = trk.findtext('name', default=os.path.basename(path))
+
+    if typ and 'run' not in typ:
         return None
 
-    name = trk.findtext('gpx:name', default=os.path.basename(path), namespaces=NS)
-
     points = []
-    for pt in trk.findall('.//gpx:trkpt', NS):
+    # Collect track points, handling both namespaced and plain GPX files
+    if use_ns:
+        trkpts = trk.findall('.//gpx:trkpt', NS)
+    else:
+        trkpts = trk.findall('.//trkpt')
+
+    for pt in trkpts:
         try:
             lat = float(pt.get('lat'))
             lon = float(pt.get('lon'))
         except (TypeError, ValueError):
             continue
-        time_el = pt.findtext('gpx:time', namespaces=NS)
+        if use_ns:
+            time_el = pt.findtext('gpx:time', namespaces=NS)
+            hr_el = pt.find('.//gpxtpx:hr', NS)
+        else:
+            time_el = pt.findtext('time')
+            hr_el = pt.find('.//hr') or pt.find('hr')
         if time_el:
             try:
                 t = datetime.strptime(time_el, '%Y-%m-%dT%H:%M:%SZ')
@@ -67,7 +96,6 @@ def parse_gpx(path):
                 t = None
         else:
             t = None
-        hr_el = pt.find('.//gpxtpx:hr', NS)
         hr = int(hr_el.text) if hr_el is not None and hr_el.text else None
         points.append({'lat': lat, 'lon': lon, 'time': t, 'hr': hr})
 
@@ -115,6 +143,47 @@ def parse_gpx(path):
                         points[i]['lat'], points[i]['lon'])
         cum_dists.append(cum_dists[-1] + seg)
 
+    # Helper: estimate timestamp at a given cumulative distance (metres)
+    def _time_at_distance(points, cum_dists, target_m):
+        # Indices with timestamps
+        timed = [i for i, p in enumerate(points) if p['time']]
+        if not timed:
+            return None
+        for idx in timed:
+            if cum_dists[idx] >= target_m:
+                # find previous timed index before idx
+                prev = None
+                for j in reversed(timed):
+                    if j < idx:
+                        prev = j
+                        break
+                if prev is None:
+                    return points[idx]['time']
+                d0 = cum_dists[prev]
+                d1 = cum_dists[idx]
+                t0 = points[prev]['time']
+                t1 = points[idx]['time']
+                if d1 == d0:
+                    return t1
+                frac = (target_m - d0) / (d1 - d0)
+                return t0 + (t1 - t0) * frac
+        return None
+
+    def _pace_for_k(km):
+        if not times:
+            return None
+        target_m = km * 1000.0
+        if cum_dists[-1] < target_m:
+            return None
+        t_at = _time_at_distance(points, cum_dists, target_m)
+        if not t_at:
+            return None
+        dur_s = (t_at - times[0]).total_seconds()
+        if dur_s <= 0:
+            return None
+        # pace in minutes per km
+        return (dur_s / 60.0) / km
+
     # Distance (km) at which HR first reaches 170 bpm (if available)
     km_to_hr170 = None
     for i, p in enumerate(points):
@@ -139,6 +208,8 @@ def parse_gpx(path):
         'max_hr': max(hrs) if hrs else None,
         'avg_hr': float(np.mean(hrs)) if hrs else None,
         'km_to_hr170': km_to_hr170,
+        'mean_pace_5': _pace_for_k(5),
+        'mean_pace_10': _pace_for_k(10),
     }
 
 def is_rehovot(activity):
@@ -296,7 +367,6 @@ def build_html(activities, cluster_labels, output_path):
             'date_ts':     a['date'].timestamp() if a['date'] else None,
             'dist_km':     round(a['dist_km'], 2),
             'duration_s':  a['duration_s'],
-            'avg_speed':   round(a['avg_speed_kmh'], 2),
             'max_hr':      a['max_hr'],
             'avg_hr':      round(a['avg_hr'], 1) if a['avg_hr'] else None,
             'has_hr':      a['has_hr'],
@@ -306,6 +376,8 @@ def build_html(activities, cluster_labels, output_path):
             'is_rehovot':  a.get('is_rehovot', False),
             'km_to_hr170': round(a.get('km_to_hr170'), 2) if a.get('km_to_hr170') is not None else None,
             'hr_series':   a.get('hr_series', []),
+            'mean_pace_5': round(a.get('mean_pace_5'), 2) if a.get('mean_pace_5') is not None else None,
+            'mean_pace_10': round(a.get('mean_pace_10'), 2) if a.get('mean_pace_10') is not None else None,
         }
 
     acts_json = json.dumps([ser(a) for a in activities])
@@ -327,12 +399,16 @@ def build_html(activities, cluster_labels, output_path):
 
 def main():
     parser = argparse.ArgumentParser(description='Strava GPX HR Analysis')
-    parser.add_argument('--gpx-dir', default='.', help='Directory containing GPX files')
+    parser.add_argument('--gpx-dir', default='/media/yuval/KINGSTON/Strava/activities', help='Directory containing GPX files')
     parser.add_argument('--out', default='running_analysis.html', help='Output HTML file')
     parser.add_argument('--cluster-eps', type=float, default=1.5,
                         help='DBSCAN radius in km for route clustering (default 1.5)')
+    parser.add_argument('--cluster', action='store_true',
+                        help='Perform DBSCAN clustering to assign cluster labels (disabled by default)')
     parser.add_argument('--cluster-map', action='store_true',
-                        help='Write a cluster map HTML file showing tracks coloured by cluster')
+                        help='Write a cluster map HTML file showing tracks coloured by cluster (implies --cluster)')
+    parser.add_argument('--hr-check', action='store_true',
+                        help='Perform HR fault detection (disabled by default)')
     args = parser.parse_args()
 
     # ── Find GPX files
@@ -349,11 +425,20 @@ def main():
     # ── Parse
     activities = []
     for p in paths:
+        bn = os.path.basename(p)
+        # If filename is an integer activity id and is known-bad, skip early
+        try:
+            aid = int(bn[:-4])
+        except Exception:
+            aid = None
+        if aid is not None and aid in bad:
+            # print(f"  skip: {bn} (known bad activity)")
+            continue
         a = parse_gpx(p)
         if a:
             activities.append(a)
-        else:
-            print(f"  skip: {os.path.basename(p)} (not a run or unparseable)")
+        # else:
+        #     print(f"  skip: {bn} (not a run or unparseable)")
 
     if not activities:
         print("No valid running activities found.")
@@ -363,16 +448,26 @@ def main():
     # ── Sort by date
     activities.sort(key=lambda a: a['date'] or datetime.min)
 
-    # ── Cluster
-    try:
-        out_map = None
-        if args.cluster_map:
-            base, _ = os.path.splitext(args.out)
-            out_map = f"{base}_clusters_map.html"
-        labels = cluster_activities(activities, eps_km=args.cluster_eps,
-                                    plot=args.cluster_map, out_html=out_map)
-    except Exception as e:
-        print(f"  Clustering failed ({e}); assigning all to cluster 0.")
+    # ── Filter out short runs (< 5 km)
+    orig_count = len(activities)
+    activities = [a for a in activities if a['dist_km'] >= 5.0]
+    if len(activities) != orig_count:
+        print(f"Filtered out {orig_count - len(activities)} activities shorter than 5 km; {len(activities)} remain.")
+
+    # ── Cluster (only if explicitly requested)
+    if args.cluster or args.cluster_map:
+        try:
+            out_map = None
+            if args.cluster_map:
+                base, _ = os.path.splitext(args.out)
+                out_map = f"{base}_clusters_map.html"
+            labels = cluster_activities(activities, eps_km=args.cluster_eps,
+                                        plot=bool(args.cluster_map), out_html=out_map)
+        except Exception as e:
+            print(f"  Clustering failed ({e}); assigning all to cluster 0.")
+            labels = [0] * len(activities)
+    else:
+        # default: no clustering performed, assign cluster 0 to all activities
         labels = [0] * len(activities)
 
     cluster_counts = defaultdict(int)
@@ -380,20 +475,26 @@ def main():
         cluster_counts[l] += 1
     print(f"Clusters: { {k:v for k,v in sorted(cluster_counts.items())} }")
 
-    # ── HR fault detection
+    # ── HR fault detection (only if explicitly requested)
     n_faulty = 0
-    for a in activities:
-        if a['has_hr']:
-            faulty, reason = is_hr_faulty(a)
-            a['hr_faulty'] = faulty
-            a['hr_fault_reason'] = reason
-            if faulty:
-                n_faulty += 1
-                print(f"  ⚠ faulty HR: {a['file']}  ({reason})")
-        else:
+    if args.hr_check:
+        for a in activities:
+            if a['has_hr']:
+                faulty, reason = is_hr_faulty(a)
+                a['hr_faulty'] = faulty
+                a['hr_fault_reason'] = reason
+                if faulty:
+                    n_faulty += 1
+                    print(f"  ⚠ faulty HR: {a['file']}  ({reason})")
+            else:
+                a['hr_faulty'] = False
+                a['hr_fault_reason'] = ''
+        print(f"Faulty HR activities: {n_faulty}")
+    else:
+        # mark as unchecked
+        for a in activities:
             a['hr_faulty'] = False
             a['hr_fault_reason'] = ''
-    print(f"Faulty HR activities: {n_faulty}")
 
     # ── Attach cluster labels
     for a, lbl in zip(activities, labels):
