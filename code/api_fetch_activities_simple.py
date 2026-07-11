@@ -18,6 +18,9 @@ import time
 import requests
 from glob import glob
 from datetime import datetime, timedelta
+import sys
+sys.path.insert(0, os.path.dirname(__file__))
+from gpx_utils import build_gpx_from_streams as gpx_build_from_streams
 
 
 DRIVE = '/media/yuval/KINGSTON/'
@@ -87,13 +90,12 @@ def fetch_all_activities(headers):
     return activities
 
 
-def build_gpx_from_streams(activity, headers, out_dir):
+def fetch_and_build_gpx(activity, headers, out_dir):
+    """Fetch streams (including heartrate) and delegate GPX building to gpx_utils."""
     activity_id = activity['id']
-    name = activity.get('name', f'Activity_{activity_id}')
-
     streams_url = (
         f"https://www.strava.com/api/v3/activities/{activity_id}/streams?"
-        "keys=latlng,altitude,time&key_by_type=true"
+        "keys=latlng,altitude,time,heartrate&key_by_type=true"
     )
     r = requests.get(streams_url, headers=headers)
     if r.status_code != 200:
@@ -101,59 +103,13 @@ def build_gpx_from_streams(activity, headers, out_dir):
         return False
 
     streams = r.json()
-    latlng = streams.get('latlng')
-    if isinstance(latlng, dict) and 'data' in latlng:
-        latlng = latlng['data']
-    if not latlng:
-        print(f"    No latlng for {activity_id}; skipping")
-        return False
-
-    time_stream = streams.get('time', [])
-    altitude = streams.get('altitude', [])
-    if isinstance(time_stream, dict) and 'data' in time_stream:
-        time_stream = time_stream['data']
-    if isinstance(altitude, dict) and 'data' in altitude:
-        altitude = altitude['data']
-
-    start_dt = None
-    start_date = activity.get('start_date')
-    if start_date:
-        try:
-            start_dt = datetime.fromisoformat(start_date.replace('Z', '+00:00'))
-        except Exception:
-            start_dt = None
-
-    activity_type = activity.get('type', 'Run').lower()
-    gpx_lines = [
-        '<?xml version="1.0" encoding="UTF-8"?>',
-        '<gpx version="1.1" creator="Strava streams fallback">',
-        '  <trk>',
-        f'    <name>{name}</name>',
-        f'    <type>{activity_type}</type>',
-        '    <trkseg>'
-    ]
-
-    for idx, coord in enumerate(latlng):
-        try:
-            lat, lon = coord
-        except Exception:
-            continue
-        gpx_lines.append(f'      <trkpt lat="{lat}" lon="{lon}">')
-        if idx < len(altitude):
-            gpx_lines.append(f'        <ele>{altitude[idx]}</ele>')
-        if start_dt and idx < len(time_stream):
-            ts = start_dt + timedelta(seconds=int(time_stream[idx]))
-            gpx_lines.append(f'        <time>{ts.isoformat().replace("+00:00","Z")}</time>')
-        gpx_lines.append('      </trkpt>')
-
-    gpx_lines.extend(['    </trkseg>', '  </trk>', '</gpx>'])
-
     out_path = os.path.join(out_dir, f"{activity_id}.gpx")
-    with open(out_path, 'w', encoding='utf-8') as f:
-        f.write('\n'.join(gpx_lines))
-
-    print(f"  Built GPX from streams for {activity_id}: {name}")
-    return True
+    ok = gpx_build_from_streams(activity, streams, out_path)
+    if ok:
+        print(f"  Built GPX from streams for {activity_id}: {activity.get('name', activity_id)}")
+    else:
+        print(f"  Failed to build GPX for {activity_id}")
+    return ok
 
 
 def main():
@@ -176,7 +132,7 @@ def main():
 
     print('\nProcessing activities (building GPX from streams where available)...')
     for activity in to_download:
-        build_gpx_from_streams(activity, headers, ACTIVITIES_DIR)
+        fetch_and_build_gpx(activity, headers, ACTIVITIES_DIR)
         time.sleep(0.3)
 
 

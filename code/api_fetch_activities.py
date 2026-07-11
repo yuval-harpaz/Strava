@@ -4,6 +4,10 @@ import sys
 from glob import glob
 import time
 from datetime import datetime, timedelta
+import sys
+import os
+sys.path.insert(0, os.path.dirname(__file__))
+from gpx_utils import build_gpx_from_streams as gpx_build_from_streams
 
 drive = '/media/yuval/KINGSTON/'
 if not os.path.isdir(drive):
@@ -133,7 +137,7 @@ if to_download:
                 try:
                     streams_url = (
                         f"https://www.strava.com/api/v3/activities/{activity_id}/streams?"
-                        "keys=latlng,altitude,time&key_by_type=true"
+                        "keys=latlng,altitude,time,heartrate&key_by_type=true"
                     )
                     streams_resp = requests.get(streams_url, headers=headers)
                     if streams_resp.status_code != 200:
@@ -142,66 +146,15 @@ if to_download:
                         continue
 
                     streams = streams_resp.json()
-                    latlng = streams.get('latlng')
-                    # Streams can be returned either as a raw list or as an object with a 'data' field
-                    if isinstance(latlng, dict) and 'data' in latlng:
-                        latlng = latlng['data']
-                    if not latlng:
+                    gpx_path = os.path.join(activities_dir, f"{activity_id}.gpx")
+                    ok = gpx_build_from_streams(activity, streams, gpx_path)
+                    if ok:
+                        print(f"  [{i}/{len(to_download)}] Built GPX from streams for {activity_id}: {activity_name}")
+                        time.sleep(0.5)
+                        continue
+                    else:
                         print(f"    No latlng stream available for {activity_id}; cannot build GPX.")
                         continue
-
-                    time_stream = streams.get('time', [])
-                    altitude = streams.get('altitude', [])
-                    if isinstance(time_stream, dict) and 'data' in time_stream:
-                        time_stream = time_stream['data']
-                    if isinstance(altitude, dict) and 'data' in altitude:
-                        altitude = altitude['data']
-
-                    # Parse activity start time (ISO 8601) if available to produce absolute timestamps
-                    start_dt = None
-                    start_date = activity.get('start_date')
-                    if start_date:
-                        try:
-                            # fromisoformat doesn't accept trailing Z, convert to +00:00
-                            start_dt = datetime.fromisoformat(start_date.replace('Z', '+00:00'))
-                        except Exception:
-                            start_dt = None
-
-                    # Build GPX content
-                    activity_type = activity.get('type', 'Run').lower()
-                    gpx_lines = [
-                        '<?xml version="1.0" encoding="UTF-8"?>',
-                        '<gpx version="1.1" creator="Strava API streams fallback">',
-                        '  <trk>',
-                        f'    <name>{activity.get("name", activity_id)}</name>',
-                        f'    <type>{activity_type}</type>',
-                        '    <trkseg>'
-                    ]
-
-                    for idx, coord in enumerate(latlng):
-                        try:
-                            lat, lon = coord
-                        except Exception:
-                            continue
-                        gpx_lines.append(f'      <trkpt lat="{lat}" lon="{lon}">')
-                        if idx < len(altitude):
-                            gpx_lines.append(f'        <ele>{altitude[idx]}</ele>')
-                        if start_dt and idx < len(time_stream):
-                            ts = start_dt + timedelta(seconds=int(time_stream[idx]))
-                            # Ensure Z suffix for UTC
-                            gpx_lines.append(f'        <time>{ts.isoformat().replace("+00:00","Z")}</time>')
-                        gpx_lines.append('      </trkpt>')
-
-                    gpx_lines.extend(['    </trkseg>', '  </trk>', '</gpx>'])
-
-                    gpx_path = os.path.join(activities_dir, f"{activity_id}.gpx")
-                    with open(gpx_path, 'w', encoding='utf-8') as f:
-                        f.write('\n'.join(gpx_lines))
-
-                    print(f"  [{i}/{len(to_download)}] Built GPX from streams for {activity_id}: {activity_name}")
-                    # small delay to be nice to API
-                    time.sleep(0.5)
-                    continue
                 except Exception as e:
                     print(f"    Failed to build GPX from streams for {activity_id}: {e}")
                     continue
