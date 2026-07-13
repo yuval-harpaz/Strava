@@ -1,0 +1,400 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Single Run Analysis</title>
+  <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --bg:      #0f1117;
+      --surface: #1a1d27;
+      --border:  #2a2d3a;
+      --text:    #e2e4ed;
+      --muted:   #7b7f96;
+    }
+    body { background: var(--bg); color: var(--text); font-family: 'Inter', system-ui, sans-serif; font-size:14px; padding:20px }
+    .container { max-width:1200px; margin:0 auto }
+    h1 { font-size:20px; margin-bottom:8px }
+    .muted { color:var(--muted); margin-bottom:12px }
+    #controls { margin-bottom:12px }
+    #chart-container { background: var(--surface); border:1px solid var(--border); border-radius:6px; padding:12px }
+    .info { margin-top:8px; color:var(--muted) }
+    button, label { background:transparent; color:var(--text); border:1px solid var(--border); padding:8px 10px; border-radius:6px; cursor:pointer }
+    input[type=file] { display:none }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1 id="title">Single Run Analysis</h1>
+    <div class="muted">Load a GPX file (produced by Strava or from the codebase) to analyze a single run.</div>
+
+    <div id="controls">
+      <label for="gpxfile">Load data</label>
+      <input id="gpxfile" type="file" accept=".gpx" />
+      <span class="info" id="breaks-info"></span>
+    </div>
+
+    <div id="chart-container"><div id="chart" style="height:600px"></div></div>
+  </div>
+
+  <script>
+  // Colors matching existing theme
+  const COLORS = {
+    dist: '#2ecc71',      // green
+    hr:   '#e74c3c',      // red
+    pace: '#f1c40f',      // yellow
+    median: '#9b59b6'     // purple
+  };
+
+  // Haversine distance in meters
+  function haversine(lat1, lon1, lat2, lon2) {
+    const toRad = a => a * Math.PI / 180;
+    const R = 6371000;
+    const dLat = toRad(lat2 - lat1);
+    const dLon = toRad(lon2 - lon1);
+    const a = Math.sin(dLat/2)*Math.sin(dLat/2) + Math.cos(toRad(lat1))*Math.cos(toRad(lat2))*Math.sin(dLon/2)*Math.sin(dLon/2);
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+    return R * c;
+  }
+
+  function secondsToHMS(sec) {
+    const s = Math.floor(sec % 60).toString().padStart(2,'0');
+    const m = Math.floor((sec/60) % 60).toString().padStart(2,'0');
+    const h = Math.floor(sec/3600).toString().padStart(2,'0');
+    return (h !== '00' ? h+':' : '') + m + ':' + s;
+  }
+
+  function median(arr){
+    const a = arr.filter(v => v!=null).slice().sort((x,y)=>x-y);
+    if(!a.length) return null;
+    const mid = Math.floor(a.length/2);
+    return a.length%2 ? a[mid] : (a[mid-1]+a[mid])/2;
+  }
+
+  function parseGPXText(gpxText){
+    const parser = new DOMParser();
+    const xml = parser.parseFromString(gpxText, 'application/xml');
+    const trkpts = Array.from(xml.getElementsByTagName('trkpt'));
+    const pts = trkpts.map(node => {
+      const lat = parseFloat(node.getAttribute('lat'));
+      const lon = parseFloat(node.getAttribute('lon'));
+      const timeNode = node.getElementsByTagName('time')[0];
+      const time = timeNode ? new Date(timeNode.textContent) : null;
+      // Try HR in known extension namespaces
+      let hr = null;
+      const hrs = node.getElementsByTagName('gpxtpx:hr');
+      if(hrs && hrs.length) hr = parseInt(hrs[0].textContent);
+      else {
+        // maybe plain <hr>
+        const hr2 = node.getElementsByTagName('hr');
+        if(hr2 && hr2.length) hr = parseInt(hr2[0].textContent);
+      }
+      return { lat, lon, time, hr };
+    }).filter(p => p.time !== null);
+    return pts;
+  }
+
+  function buildFromPoints(points){
+    if(!points.length) return null;
+    const times = [];
+    const elapsed = []; // seconds
+    const cumdist = []; // km
+    const hr = [];
+    const pace = []; // min/km instantaneous
+    const median1min = [];
+
+    let base = points[0].time;
+    let totalDistM = 0;
+    const latArr = [];
+    const lonArr = [];
+    const dtRaw = [0]; // seconds since previous sample, per point (used to detect real data gaps)
+    // Tracks the index of the last point whose position actually differed from its
+    // predecessor (i.e. the last confirmed "moved" point). Used so that pace after a
+    // run of duplicate coordinates is computed using the *real* elapsed time since the
+    // runner was last at a different position, not just the time since the previous
+    // (duplicate) sample. Without this, a duplicate coordinate causes the next real
+    // movement to look like it happened twice as fast/slow as it actually did, which
+    // can push the computed pace over the break threshold and get the point wrongly
+    // treated as missing data.
+    let lastMovedIdx = 0;
+    for(let i=0;i<points.length;i++){
+      const p = points[i];
+      const t = (p.time - base)/1000.0;
+      times.push(new Date(p.time));
+      elapsed.push(t);
+      hr.push(p.hr != null ? p.hr : null);
+      latArr.push(p.lat);
+      lonArr.push(p.lon);
+      if(i===0) { cumdist.push(0); pace.push(null); }
+      else {
+        const prev = points[i-1];
+        const d = haversine(prev.lat, prev.lon, p.lat, p.lon);
+        totalDistM += d;
+        cumdist.push(totalDistM/1000.0);
+        dtRaw.push((p.time - prev.time)/1000.0);
+        if(d > 0){
+          // Real movement: distance is always accurate (d is exact regardless of any
+          // duplicate points in between), but the time must be measured since the last
+          // point that was actually at a different position, not just the previous sample.
+          const dtSinceMoved = (p.time - points[lastMovedIdx].time) / 1000.0;
+          if(dtSinceMoved > 0){
+            const secondsPerKm = dtSinceMoved * 1000.0 / d;
+            pace.push(secondsPerKm / 60.0);
+          } else {
+            pace.push(null);
+          }
+          lastMovedIdx = i;
+        } else {
+          // Duplicate coordinate: no distance covered, so an instantaneous pace can't be
+          // determined for this sample alone. Leave as null; the break-detection/fill
+          // logic below will interpolate across it using the real distance and time from
+          // the last valid point to the next valid point.
+          pace.push(null);
+        }
+      }
+    }
+
+    const totalTimeSec = (points[points.length-1].time - base)/1000.0;
+    const totalDistKm = totalDistM/1000.0;
+    const avgPaceMinPerKm = totalDistKm>0 ? (totalTimeSec/totalDistKm)/60.0 : null;
+
+    // initial median (used to guess activity type for break detection)
+    const tempMedianWindow = [];
+    for(let i=0;i<elapsed.length;i++){
+      const window = [];
+      for(let j=0;j<pace.length;j++){
+        if(pace[j]==null) continue;
+        if(Math.abs(elapsed[i]-elapsed[j])<=30) window.push(pace[j]);
+      }
+      const mv = median(window);
+      median1min.push(mv);
+      if(mv!=null) tempMedianWindow.push(mv);
+    }
+    const medianPaceInitial = median(tempMedianWindow);
+    const isRunningInitial = medianPaceInitial != null && medianPaceInitial < 8.0;
+
+    // detect raw breaks using initial activity type
+    const breakThreshold = isRunningInitial ? 10.0 : 40.0; // 10 min/km for running, 40 min/km for walking
+    const rawBreaks = [];
+    let inBreak = false; let breakStartIdx = null;
+    for(let i=0;i<pace.length;i++){
+      const p = pace[i];
+      const isBreak = (p!=null && p > breakThreshold) || (p==null);
+      // treat explicit nulls as potential breaks for detection
+      if(isBreak && !inBreak){ inBreak=true; breakStartIdx=i; }
+      if(!isBreak && inBreak){ inBreak=false; rawBreaks.push([breakStartIdx, i-1]); breakStartIdx=null; }
+    }
+    if(inBreak && breakStartIdx!=null) rawBreaks.push([breakStartIdx, pace.length-1]);
+
+    // Typical sampling interval, used to tell a real data gap (missing GPS samples)
+    // apart from a normal-cadence point that just happens to be slow (e.g. a hill).
+    const sortedDt = dtRaw.filter(v => v>0).slice().sort((a,b)=>a-b);
+    const typicalDt = sortedDt.length ? sortedDt[Math.floor(sortedDt.length/2)] : 1;
+    const gapDtThreshold = Math.max(typicalDt * 2.5, typicalDt + 2);
+    // A point counts as "missing data" only if it has no computable distance (duplicate
+    // coordinate) or arrived after an abnormally long gap since the previous sample.
+    // A point recorded at the normal cadence with real, distinct coordinates is genuine
+    // data, even if its pace happens to exceed the break threshold, and must never be
+    // silently overwritten with an interpolated straight line.
+    const isMissingData = (i) => pace[i]==null || dtRaw[i] > gapDtThreshold;
+
+    // For gaps that are actually continuous missing data, check pace across gap
+    // If pace computed across gap is normal (<= threshold), fill the gap with interpolated pace values
+    for(const b of rawBreaks.slice()){
+      const s = b[0], e = b[1];
+      const before = s-1, after = e+1;
+      let paceAcross = Infinity;
+      if(before >=0 && after < pace.length){
+        const distKm = cumdist[after] - cumdist[before];
+        const timeSec = elapsed[after] - elapsed[before];
+        if(distKm>0 && timeSec>0){
+          paceAcross = (timeSec / (distKm*1000.0)) / 60.0;
+        }
+      }
+      if(paceAcross <= breakThreshold){
+        // fill only the indices that are genuinely missing data; leave real,
+        // normally-sampled points (just naturally slow) as their real computed value
+        const pBefore = (before>=0? pace[before] : null);
+        const pAfter = (after<pace.length? pace[after] : null);
+        for(let j=s;j<=e;j++){
+          if(!isMissingData(j)) continue;
+          if(pBefore!=null && pAfter!=null && elapsed[after] > elapsed[before]){
+            const frac = (elapsed[j] - elapsed[before]) / (elapsed[after] - elapsed[before]);
+            pace[j] = pBefore + (pAfter - pBefore) * frac;
+          } else {
+            pace[j] = paceAcross;
+          }
+        }
+        // remove this break from rawBreaks by marking its start as -1
+        b[0] = -1; b[1] = -1;
+      }
+    }
+
+    // build merged breaks from remaining rawBreaks
+    const remaining = rawBreaks.filter(x => x[0] >= 0);
+    const breaks = [];
+    for(const b of remaining){
+      if(breaks.length === 0){ breaks.push(b); }
+      else {
+        const lastBreak = breaks[breaks.length-1];
+        const gap = elapsed[b[0]] - elapsed[lastBreak[1]];
+        if(gap <= 60){ lastBreak[1] = b[1]; } // merge
+        else { breaks.push(b); }
+      }
+    }
+
+    // filter out breaks smaller than 30 seconds
+    const filteredBreaks = breaks.filter(b => (elapsed[b[1]] - elapsed[b[0]]) >= 30);
+
+    // Any remaining null pace values that are NOT inside a real (>=30s) break are just
+    // short, isolated gaps that couldn't be interpolated above (typically a duplicate
+    // coordinate at the very start/end of the recording with no "before" or "after"
+    // point to bridge against). Rather than showing these as missing data, carry the
+    // nearest valid pace value forward/backward into them.
+    const isInRealBreak = (i) => filteredBreaks.some(b => i >= b[0] && i <= b[1]);
+    for(let i=0;i<pace.length;i++){
+      if(pace[i]!=null || isInRealBreak(i)) continue;
+      let j = i-1;
+      while(j>=0 && (pace[j]==null || isInRealBreak(j))) j--;
+      if(j>=0){ pace[i] = pace[j]; continue; }
+      let k = i+1;
+      while(k<pace.length && (pace[k]==null || isInRealBreak(k))) k++;
+      if(k<pace.length) pace[i] = pace[k];
+    }
+
+    // recompute median1min using the (possibly) filled pace array
+    median1min.length = 0;
+    const tempMedianWindow2 = [];
+    for(let i=0;i<elapsed.length;i++){
+      const window = [];
+      for(let j=0;j<pace.length;j++){
+        if(pace[j]==null) continue;
+        if(Math.abs(elapsed[i]-elapsed[j])<=30) window.push(pace[j]);
+      }
+      const mv = median(window);
+      median1min.push(mv);
+      if(mv!=null) tempMedianWindow2.push(mv);
+    }
+    const medianPace = median(tempMedianWindow2);
+    const isRunning = medianPace != null && medianPace < 8.0;
+
+    return { times, elapsed, cumdist, hr, pace, median1min, totalTimeSec, totalDistKm, avgPaceMinPerKm, breaks: filteredBreaks, isRunning, medianPace, latArr, lonArr };
+  }
+
+  function drawChart(data){
+    const { times, cumdist, hr, pace, median1min, totalTimeSec, totalDistKm, avgPaceMinPerKm, breaks, isRunning, latArr, lonArr } = data;
+
+    // Hide pace during breaks: create masked pace arrays
+    const paceVisible = pace.map((p, i) => {
+      for(const b of breaks){
+        if(i >= b[0] && i <= b[1]) return null;
+      }
+      return p;
+    });
+    const medianVisible = median1min.map((p, i) => {
+      for(const b of breaks){
+        if(i >= b[0] && i <= b[1]) return null;
+      }
+      return p;
+    });
+
+    // coords for hover
+    const coords = times.map((_,i) => (latArr && lonArr ? [latArr[i], lonArr[i]] : [null, null]));
+
+    // For walking, convert pace (min/km) to speed (km/h)
+    const paceDisplay = isRunning ? paceVisible : paceVisible.map(p => p != null ? 60.0 / p : null);
+    const medianDisplay = isRunning ? medianVisible : medianVisible.map(p => p != null ? 60.0 / p : null);
+
+    let tracePace, traceMedian, traceRaw;
+    if(isRunning){
+      traceRaw = { name:'', x:times, y:paceVisible, customdata:coords, mode:'markers', marker:{color:COLORS.pace, size:4, opacity:0.6}, hovertemplate:'%{x|%H:%M:%S}<br>Pace: %{y:.2f} min/km<br>Lat: %{customdata[0]:.5f} Lon: %{customdata[1]:.5f}<extra></extra>', showlegend:false };
+      traceMedian = { name:'Median (±30s)', x:times, y:medianDisplay, customdata:coords, mode:'lines', line:{color:COLORS.pace, width:3}, hovertemplate:'%{x|%H:%M:%S}<br>Median: %{y:.2f} min/km<br>Lat: %{customdata[0]:.5f} Lon: %{customdata[1]:.5f}<extra></extra>' };
+    } else {
+      traceRaw = { name:'', x:times, y:paceDisplay, customdata:coords, mode:'markers', marker:{color:COLORS.pace, size:4, opacity:0.6}, hovertemplate:'%{x|%H:%M:%S}<br>Speed: %{y:.2f} km/h<br>Lat: %{customdata[0]:.5f} Lon: %{customdata[1]:.5f}<extra></extra>', showlegend:false };
+      traceMedian = { name:'Median (±30s)', x:times, y:medianDisplay, customdata:coords, mode:'lines', line:{color:COLORS.pace, width:3}, hovertemplate:'%{x|%H:%M:%S}<br>Median: %{y:.2f} km/h<br>Lat: %{customdata[0]:.5f} Lon: %{customdata[1]:.5f}<extra></extra>' };
+    }
+
+    const traceDist = { name:'Distance (km)', x:times, y:cumdist, customdata:coords, mode:'lines', line:{color:COLORS.dist, width:3}, yaxis:'y2', hovertemplate:'%{x|%H:%M:%S}<br>Distance: %{y:.3f} km<br>Lat: %{customdata[0]:.5f} Lon: %{customdata[1]:.5f}<extra></extra>' };
+    const traceHR = { name:'Heart rate (bpm)', x:times, y:hr, customdata:coords, mode:'lines', line:{color:COLORS.hr, width:1.5}, yaxis:'y2', hovertemplate:'%{x|%H:%M:%S}<br>HR: %{y} bpm<br>Lat: %{customdata[0]:.5f} Lon: %{customdata[1]:.5f}<extra></extra>' };
+
+    // build background shapes for breaks (brighter: 20% increase in alpha)
+    const shapes = breaks.map(b => {
+      const x0 = times[b[0]];
+      const x1 = times[b[1]];
+      return { type:'rect', xref:'x', yref:'paper', x0:x0, x1:x1, y0:0, y1:1, fillcolor:'rgba(155,89,182,0.28)', line:{width:0} };
+    });
+
+    // Format title
+    const distanceStr = Math.round(totalDistKm * 1000).toLocaleString() + ' m';
+    const paceStr = avgPaceMinPerKm ? (Math.floor(avgPaceMinPerKm)+':'+String(Math.round((avgPaceMinPerKm%1)*60)).padStart(2,'0')+' min/km') : '';
+    const titleText = isRunning ?
+      `Total  ${secondsToHMS(totalTimeSec)}  ${distanceStr}  ${paceStr}` :
+      `Total  ${secondsToHMS(totalTimeSec)}  ${distanceStr}`;
+    document.getElementById('title').textContent = titleText;
+
+    // Format info line with date, start time, activity number (using times[0])
+    const startTime = times[0];
+    const dateStr = startTime.toLocaleDateString('en-GB');
+    const timeStr = startTime.toLocaleTimeString('en-GB', {hour:'2-digit', minute:'2-digit', second:'2-digit'});
+    const activityTypeStr = isRunning ? 'Running' : 'Walking';
+    document.getElementById('breaks-info').textContent = `${dateStr} ${timeStr} ${activityTypeStr} (${breaks.length} break(s))`;
+
+    let traces, layout;
+    if(isRunning){
+      traces = [traceRaw, traceMedian, traceDist, traceHR];
+      layout = {
+        hovermode:'closest',
+        plot_bgcolor:'rgba(0,0,0,0)', paper_bgcolor:'rgba(0,0,0,0)',
+        font:{ color: '#e2e4ed', family: 'Inter, system-ui' },
+        xaxis:{ title:'Time', gridcolor:'#2a2d3a', tickformat:'%H:%M:%S' },
+        yaxis:{ title:'Pace (min/km)', range:[0,20], gridcolor:'#2a2d3a' },
+        yaxis2:{ title:'Distance (km) / HR (bpm)', overlaying:'y', side:'right', gridcolor:'#2a2d3a', range:[0, 200] },
+        shapes: shapes,
+        legend:{ orientation:'h', x:0, y:1.05 },
+        margin:{ l:60, r:80, t:100, b:80 }, height:600,
+        hoverlabel:{ bgcolor: '#1a1d27', bordercolor: '#6c63ff', font: {color: '#e2e4ed'} }
+      };
+    } else {
+      traces = [traceRaw, traceMedian, traceDist];
+      layout = {
+        hovermode:'closest',
+        plot_bgcolor:'rgba(0,0,0,0)', paper_bgcolor:'rgba(0,0,0,0)',
+        font:{ color: '#e2e4ed', family: 'Inter, system-ui' },
+        xaxis:{ title:'Time', gridcolor:'#2a2d3a', tickformat:'%H:%M:%S' },
+        yaxis:{ title:'Speed (km/h)', range:[0,10], gridcolor:'#2a2d3a' },
+        yaxis2:{ title:'Distance (km)', overlaying:'y', side:'right', gridcolor:'#2a2d3a' },
+        shapes: shapes,
+        legend:{ orientation:'h', x:0, y:1.05 },
+        margin:{ l:60, r:80, t:100, b:80 }, height:600,
+        hoverlabel:{ bgcolor: '#1a1d27', bordercolor: '#6c63ff', font: {color: '#e2e4ed'} }
+      };
+    }
+
+    Plotly.react('chart', traces, layout, {responsive:true});
+  }
+
+  document.getElementById('gpxfile').addEventListener('change', (ev) => {
+    const f = ev.target.files[0];
+    if(!f) return;
+    const reader = new FileReader();
+    reader.onload = function(e){
+      try{
+        const pts = parseGPXText(e.target.result);
+        const data = buildFromPoints(pts);
+        if(!data) { alert('No time points found in GPX.'); return; }
+        drawChart(data);
+      } catch(err){
+        console.error(err); alert('Failed to parse GPX: '+err.message);
+      }
+    };
+    reader.readAsText(f);
+  });
+
+  // click the label to open file dialog when user clicks "Load data" label
+  document.querySelector('label[for="gpxfile"]').addEventListener('click', ()=> document.getElementById('gpxfile').click());
+  </script>
+</body>
+</html>
+
