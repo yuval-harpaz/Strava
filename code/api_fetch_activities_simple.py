@@ -23,7 +23,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 from gpx_utils import build_gpx_from_streams as gpx_build_from_streams
 
 
-DRIVE = '/media/yuval/KINGSTON/'
+DRIVE = '/media/yuval/PNY/'
 ACTIVITIES_DIR = os.path.join(DRIVE, 'Strava', 'activities')
 
 

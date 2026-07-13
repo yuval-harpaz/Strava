@@ -9,7 +9,7 @@ import os
 sys.path.insert(0, os.path.dirname(__file__))
 from gpx_utils import build_gpx_from_streams as gpx_build_from_streams
 
-drive = '/media/yuval/KINGSTON/'
+drive = '/media/yuval/PNY/'
 if not os.path.isdir(drive):
     raise ValueError("Where is the drive?")
 activities_dir = drive + 'Strava/activities'

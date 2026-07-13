@@ -399,7 +399,7 @@ def build_html(activities, cluster_labels, output_path):
 
 def main():
     parser = argparse.ArgumentParser(description='Strava GPX HR Analysis')
-    parser.add_argument('--gpx-dir', default='/media/yuval/KINGSTON/Strava/activities', help='Directory containing GPX files')
+    parser.add_argument('--gpx-dir', default='/media/yuval/PNY/Strava/activities', help='Directory containing GPX files')
     parser.add_argument('--out', default='running_analysis.html', help='Output HTML file')
     parser.add_argument('--cluster-eps', type=float, default=1.5,
                         help='DBSCAN radius in km for route clustering (default 1.5)')
