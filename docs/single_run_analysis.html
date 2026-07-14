@@ -200,35 +200,61 @@
     // silently overwritten with an interpolated straight line.
     const isMissingData = (i) => pace[i]==null || dtRaw[i] > gapDtThreshold;
 
-    // For gaps that are actually continuous missing data, check pace across gap
-    // If pace computed across gap is normal (<= threshold), fill the gap with interpolated pace values
+    // For candidate breaks that are ENTIRELY missing data (duplicate coordinates or a
+    // real GPS gap, i.e. nothing measured), check the pace computed straight across the
+    // gap: if it's reasonable, this was just a brief data hiccup during otherwise-normal
+    // movement, not a real pause, so smooth over it. But if the candidate contains ANY
+    // real, normally-sampled point (distinct coordinates, normal time interval) whose
+    // pace is above the break threshold, that's a genuine measured change in behavior
+    // (e.g. the runner slowed to a walk) -- always keep that as a real break, no matter
+    // what the boundary-to-boundary average pace works out to. Averaging across the
+    // break would otherwise wash out real, sustained walking segments whenever the
+    // faster pace just outside the break pulls the average back under the threshold.
     for(const b of rawBreaks.slice()){
       const s = b[0], e = b[1];
       const before = s-1, after = e+1;
-      let paceAcross = Infinity;
-      if(before >=0 && after < pace.length){
-        const distKm = cumdist[after] - cumdist[before];
-        const timeSec = elapsed[after] - elapsed[before];
-        if(distKm>0 && timeSec>0){
-          paceAcross = (timeSec / (distKm*1000.0)) / 60.0;
+      const pBefore = (before>=0? pace[before] : null);
+      const pAfter = (after<pace.length? pace[after] : null);
+
+      let allMissing = true;
+      for(let j=s;j<=e;j++){ if(!isMissingData(j)){ allMissing = false; break; } }
+
+      if(allMissing){
+        let paceAcross = Infinity;
+        if(before >=0 && after < pace.length){
+          const distKm = cumdist[after] - cumdist[before];
+          const timeSec = elapsed[after] - elapsed[before];
+          if(distKm>0 && timeSec>0){
+            paceAcross = (timeSec / (distKm*1000.0)) / 60.0;
+          }
         }
-      }
-      if(paceAcross <= breakThreshold){
-        // fill only the indices that are genuinely missing data; leave real,
-        // normally-sampled points (just naturally slow) as their real computed value
-        const pBefore = (before>=0? pace[before] : null);
-        const pAfter = (after<pace.length? pace[after] : null);
+        if(paceAcross <= breakThreshold){
+          for(let j=s;j<=e;j++){
+            if(pBefore!=null && pAfter!=null && elapsed[after] > elapsed[before]){
+              const frac = (elapsed[j] - elapsed[before]) / (elapsed[after] - elapsed[before]);
+              pace[j] = pBefore + (pAfter - pBefore) * frac;
+            } else {
+              pace[j] = paceAcross;
+            }
+          }
+          // not a real break: remove it
+          b[0] = -1; b[1] = -1;
+        }
+      } else {
+        // Real, measured slow data is present (e.g. a walk break): keep this as a
+        // genuine break. Only fill in the sub-points that are themselves missing data,
+        // for chart continuity; leave every real measured point exactly as computed.
         for(let j=s;j<=e;j++){
           if(!isMissingData(j)) continue;
           if(pBefore!=null && pAfter!=null && elapsed[after] > elapsed[before]){
             const frac = (elapsed[j] - elapsed[before]) / (elapsed[after] - elapsed[before]);
             pace[j] = pBefore + (pAfter - pBefore) * frac;
-          } else {
-            pace[j] = paceAcross;
+          } else if(pBefore!=null){
+            pace[j] = pBefore;
+          } else if(pAfter!=null){
+            pace[j] = pAfter;
           }
         }
-        // remove this break from rawBreaks by marking its start as -1
-        b[0] = -1; b[1] = -1;
       }
     }
 
@@ -286,13 +312,8 @@
   function drawChart(data){
     const { times, cumdist, hr, pace, median1min, totalTimeSec, totalDistKm, avgPaceMinPerKm, breaks, isRunning, latArr, lonArr } = data;
 
-    // Hide pace during breaks: create masked pace arrays
-    const paceVisible = pace.map((p, i) => {
-      for(const b of breaks){
-        if(i >= b[0] && i <= b[1]) return null;
-      }
-      return p;
-    });
+    // Hide the median line during breaks (it's not meaningful across a break), but
+    // keep the raw per-point pace markers visible everywhere, including during breaks.
     const medianVisible = median1min.map((p, i) => {
       for(const b of breaks){
         if(i >= b[0] && i <= b[1]) return null;
@@ -304,16 +325,16 @@
     const coords = times.map((_,i) => (latArr && lonArr ? [latArr[i], lonArr[i]] : [null, null]));
 
     // For walking, convert pace (min/km) to speed (km/h)
-    const paceDisplay = isRunning ? paceVisible : paceVisible.map(p => p != null ? 60.0 / p : null);
+    const paceDisplay = isRunning ? pace : pace.map(p => p != null ? 60.0 / p : null);
     const medianDisplay = isRunning ? medianVisible : medianVisible.map(p => p != null ? 60.0 / p : null);
 
     let tracePace, traceMedian, traceRaw;
     if(isRunning){
-      traceRaw = { name:'', x:times, y:paceVisible, customdata:coords, mode:'markers', marker:{color:COLORS.pace, size:4, opacity:0.6}, hovertemplate:'%{x|%H:%M:%S}<br>Pace: %{y:.2f} min/km<br>Lat: %{customdata[0]:.5f} Lon: %{customdata[1]:.5f}<extra></extra>', showlegend:false };
-      traceMedian = { name:'Median (±30s)', x:times, y:medianDisplay, customdata:coords, mode:'lines', line:{color:COLORS.pace, width:3}, hovertemplate:'%{x|%H:%M:%S}<br>Median: %{y:.2f} min/km<br>Lat: %{customdata[0]:.5f} Lon: %{customdata[1]:.5f}<extra></extra>' };
+      traceRaw = { name:'', x:times, y:pace, customdata:coords, mode:'markers', marker:{color:COLORS.pace, size:4, opacity:0.6}, hovertemplate:'%{x|%H:%M:%S}<br>Pace: %{y:.2f} min/km<br>Lat: %{customdata[0]:.5f} Lon: %{customdata[1]:.5f}<extra></extra>', showlegend:false };
+      traceMedian = { name:'Median (±30s)', x:times, y:medianDisplay, customdata:coords, mode:'lines', line:{color:COLORS.pace, width:3}, connectgaps:false, hovertemplate:'%{x|%H:%M:%S}<br>Median: %{y:.2f} min/km<br>Lat: %{customdata[0]:.5f} Lon: %{customdata[1]:.5f}<extra></extra>' };
     } else {
       traceRaw = { name:'', x:times, y:paceDisplay, customdata:coords, mode:'markers', marker:{color:COLORS.pace, size:4, opacity:0.6}, hovertemplate:'%{x|%H:%M:%S}<br>Speed: %{y:.2f} km/h<br>Lat: %{customdata[0]:.5f} Lon: %{customdata[1]:.5f}<extra></extra>', showlegend:false };
-      traceMedian = { name:'Median (±30s)', x:times, y:medianDisplay, customdata:coords, mode:'lines', line:{color:COLORS.pace, width:3}, hovertemplate:'%{x|%H:%M:%S}<br>Median: %{y:.2f} km/h<br>Lat: %{customdata[0]:.5f} Lon: %{customdata[1]:.5f}<extra></extra>' };
+      traceMedian = { name:'Median (±30s)', x:times, y:medianDisplay, customdata:coords, mode:'lines', line:{color:COLORS.pace, width:3}, connectgaps:false, hovertemplate:'%{x|%H:%M:%S}<br>Median: %{y:.2f} km/h<br>Lat: %{customdata[0]:.5f} Lon: %{customdata[1]:.5f}<extra></extra>' };
     }
 
     const traceDist = { name:'Distance (km)', x:times, y:cumdist, customdata:coords, mode:'lines', line:{color:COLORS.dist, width:3}, yaxis:'y2', hovertemplate:'%{x|%H:%M:%S}<br>Distance: %{y:.3f} km<br>Lat: %{customdata[0]:.5f} Lon: %{customdata[1]:.5f}<extra></extra>' };
