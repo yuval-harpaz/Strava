@@ -173,6 +173,38 @@
     const totalDistKm = totalDistM/1000.0;
     const avgPaceMinPerKm = totalDistKm>0 ? (totalTimeSec/totalDistKm)/60.0 : null;
 
+    // Missing-value handling: a null pace value means no distance was measured for that
+    // sample (duplicate GPS coordinate). Short runs of these are just noise -- left alone
+    // as gaps. Longer runs are filled with a single CONSTANT pace value: the real distance
+    // and time between the last valid sample before the run and the next valid sample after
+    // it (i.e. pace as a function of distance/time bridging the gap), not an interpolated
+    // ramp -- the whole run gets the same one number.
+    const missingGapThreshold = 10; // seconds
+    {
+      let i = 0;
+      while(i < pace.length){
+        if(pace[i] != null){ i++; continue; }
+        let start = i, end = i;
+        while(end+1 < pace.length && pace[end+1]==null) end++;
+        const before = start-1, after = end+1;
+        if(before>=0 && after<pace.length){
+          const gapDuration = elapsed[after] - elapsed[before];
+          if(gapDuration >= missingGapThreshold){
+            const distKm = cumdist[after] - cumdist[before];
+            if(distKm>0 && gapDuration>0){
+              const constPace = (gapDuration / distKm) / 60.0;
+              for(let j=start;j<=end;j++) pace[j] = constPace;
+            }
+            // if distance is also ~0 across the gap (no computable pace), leave as null
+          }
+          // else: gap shorter than the threshold -- ignored, left as a null gap
+        }
+        // else: run touches the very start/end of the recording with no boundary on one
+        // side to bridge against -- left as a null gap
+        i = end + 1;
+      }
+    }
+
     // initial median (used to guess activity type for break detection)
     const tempMedianWindow = [];
     for(let i=0;i<elapsed.length;i++){
@@ -204,6 +236,7 @@
     const breakThreshold = isRunningInitial ? 10.0 : 40.0; // 10 min/km for running, 40 min/km for walking
     const T = 30; // seconds
     const halfT = T / 2;
+    const rawSamplingGapThreshold = 10; // seconds -- matches the missing-value gap threshold
 
     function windowMedianPace(i){
       const window = [];
@@ -215,7 +248,21 @@
     }
     const isCandidate = (i) => {
       const wm = windowMedianPace(i);
-      return wm == null || wm > breakThreshold;
+      if(wm == null || wm > breakThreshold) return true;
+      // The windowed median can look fine even right after a genuine device dropout
+      // (no samples recorded for a while), because it gets diluted by real, fast samples
+      // just past the gap. But we have no idea what happened *during* the gap, and the
+      // boundary-to-boundary pace across it says slow -- so a real raw sampling gap with a
+      // slow bracketing pace always counts as a candidate, regardless of the windowed median.
+      if(i>0){
+        const gapDt = elapsed[i] - elapsed[i-1];
+        if(gapDt >= rawSamplingGapThreshold){
+          const gapDistKm = cumdist[i] - cumdist[i-1];
+          const gapPace = gapDistKm>0 ? (gapDt/gapDistKm)/60.0 : Infinity;
+          if(gapPace > breakThreshold) return true;
+        }
+      }
+      return false;
     };
 
     const rawSegments = [];
@@ -233,8 +280,6 @@
     for(const b of longEnough){
       const s = b[0], e = b[1];
       const before = s-1, after = e+1;
-      const pBefore = (before>=0? pace[before] : null);
-      const pAfter = (after<pace.length? pace[after] : null);
 
       let paceAcross = null;
       if(before>=0 && after<pace.length){
@@ -245,38 +290,7 @@
         }
       }
       const isRealBreak = paceAcross != null && paceAcross > breakThreshold;
-
-      if(isRealBreak){
-        confirmedBreaks.push(b);
-        // fill only the genuinely missing (null) points inside, for chart continuity;
-        // leave every real measured sample exactly as computed.
-        for(let j=s;j<=e;j++){
-          if(pace[j]!=null) continue;
-          if(pBefore!=null && pAfter!=null && elapsed[after] > elapsed[before]){
-            const frac = (elapsed[j] - elapsed[before]) / (elapsed[after] - elapsed[before]);
-            pace[j] = pBefore + (pAfter - pBefore) * frac;
-          } else if(pBefore!=null){
-            pace[j] = pBefore;
-          } else if(pAfter!=null){
-            pace[j] = pAfter;
-          }
-        }
-      } else {
-        // Didn't hold up to the double-check: not a real break, likely bad/noisy samples
-        // or a brief GPS hiccup. Smooth the whole segment instead of flagging it.
-        for(let j=s;j<=e;j++){
-          if(pBefore!=null && pAfter!=null && elapsed[after] > elapsed[before]){
-            const frac = (elapsed[j] - elapsed[before]) / (elapsed[after] - elapsed[before]);
-            pace[j] = pBefore + (pAfter - pBefore) * frac;
-          } else if(paceAcross!=null){
-            pace[j] = paceAcross;
-          } else if(pBefore!=null){
-            pace[j] = pBefore;
-          } else if(pAfter!=null){
-            pace[j] = pAfter;
-          }
-        }
-      }
+      if(isRealBreak) confirmedBreaks.push(b);
     }
 
     // merge confirmed breaks that are close together (gap <= 60s)
@@ -292,28 +306,23 @@
     }
     const filteredBreaks = breaks;
 
-    // Any remaining null pace values (e.g. at the very start/end of the recording, with
-    // no "before" or "after" point to bridge against) are just isolated gaps. Carry the
-    // nearest valid pace value forward/backward into them so nothing is left null.
-    const isInRealBreak = (i) => filteredBreaks.some(b => i >= b[0] && i <= b[1]);
-    for(let i=0;i<pace.length;i++){
-      if(pace[i]!=null || isInRealBreak(i)) continue;
-      let j = i-1;
-      while(j>=0 && (pace[j]==null || isInRealBreak(j))) j--;
-      if(j>=0){ pace[i] = pace[j]; continue; }
-      let k = i+1;
-      while(k<pace.length && (pace[k]==null || isInRealBreak(k))) k++;
-      if(k<pace.length) pace[i] = pace[k];
-    }
+    // recompute median1min using the (possibly) filled pace array, but excluding samples
+    // that fall inside a confirmed break from anyone else's rolling window. A break's
+    // interior pace values (near-zero movement over many seconds, or a gap-filled constant)
+    // are real but extreme -- letting them bleed into a nearby non-break point's ±30s window
+    // would otherwise make that point's median swing wildly as the window slides past the
+    // break, producing an artificial cliff/decline right at the break boundary even though
+    // that point itself is outside the break.
+    const isInAnyBreak = (i) => filteredBreaks.some(b => i >= b[0] && i <= b[1]);
+    const paceForMedian = pace.map((p, i) => isInAnyBreak(i) ? null : p);
 
-    // recompute median1min using the (possibly) filled pace array
     median1min.length = 0;
     const tempMedianWindow2 = [];
     for(let i=0;i<elapsed.length;i++){
       const window = [];
-      for(let j=0;j<pace.length;j++){
-        if(pace[j]==null) continue;
-        if(Math.abs(elapsed[i]-elapsed[j])<=30) window.push(pace[j]);
+      for(let j=0;j<paceForMedian.length;j++){
+        if(paceForMedian[j]==null) continue;
+        if(Math.abs(elapsed[i]-elapsed[j])<=30) window.push(paceForMedian[j]);
       }
       const mv = median(window);
       median1min.push(mv);
@@ -321,6 +330,38 @@
     }
     const medianPace = median(tempMedianWindow2);
     const isRunning = medianPace != null && medianPace < 8.0;
+
+    // A genuine raw sampling gap (the recording device didn't log anything for a while,
+    // e.g. an auto-pause dropout) has no data at all in between -- connecting the two
+    // flanking points with a straight line implies a smooth trend that was never measured.
+    // Insert one null-valued vertex into each gap so the pace/median/HR lines visually
+    // break there instead (distance is left continuous, since accumulating distance
+    // linearly across a gap is still a reasonable assumption).
+    const gapIndices = [];
+    for(let i=1;i<elapsed.length;i++){
+      if(elapsed[i]-elapsed[i-1] >= rawSamplingGapThreshold) gapIndices.push(i);
+    }
+    for(let k=gapIndices.length-1;k>=0;k--){
+      const i = gapIndices[k];
+      const midElapsed = (elapsed[i-1]+elapsed[i])/2;
+      const midTime = new Date(times[i-1].getTime() + (times[i].getTime()-times[i-1].getTime())/2);
+      const midDist = (cumdist[i-1]+cumdist[i])/2;
+      const midLat = (latArr[i-1]+latArr[i])/2;
+      const midLon = (lonArr[i-1]+lonArr[i])/2;
+      times.splice(i,0,midTime);
+      elapsed.splice(i,0,midElapsed);
+      cumdist.splice(i,0,midDist);
+      hr.splice(i,0,null);
+      pace.splice(i,0,null);
+      median1min.splice(i,0,null);
+      latArr.splice(i,0,midLat);
+      lonArr.splice(i,0,midLon);
+      // shift break index ranges to account for the newly-inserted row
+      for(const b of filteredBreaks){
+        if(b[0] >= i) b[0] += 1;
+        if(b[1] >= i) b[1] += 1;
+      }
+    }
 
     return { times, elapsed, cumdist, hr, pace, median1min, totalTimeSec, totalDistKm, avgPaceMinPerKm, breaks: filteredBreaks, isRunning, medianPace, latArr, lonArr };
   }
