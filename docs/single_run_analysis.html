@@ -188,77 +188,70 @@
     const medianPaceInitial = median(tempMedianWindow);
     const isRunningInitial = medianPaceInitial != null && medianPaceInitial < 8.0;
 
-    // detect raw breaks using initial activity type
+    // Break-detection scheme:
+    // 1) A point is a break CANDIDATE if the MEDIAN pace within a T=30s window centered on
+    //    it is over the activity's threshold. Since the median is the middle value, a median
+    //    above threshold means at least half the samples in that window are over threshold --
+    //    directly implementing "most of the samples over threshold for T seconds" without
+    //    letting a single noisy/bad sample flip the candidacy of an otherwise sustained slowdown.
+    // 2) Consecutive candidate points are grouped into one candidate segment.
+    // 3) Only segments lasting at least T=30s are considered further (short blips are ignored).
+    // 4) Double-check: compute the pace across the whole segment using only the real,
+    //    measured points immediately before and after it (distance/time bracketing the
+    //    segment). Only if that bracketing pace is ALSO over the threshold do we confirm
+    //    it as a real break (used for the background marker and break count). Otherwise it's
+    //    treated as bad data mid-stream, not a pause, and the pace is smoothed across it.
     const breakThreshold = isRunningInitial ? 10.0 : 40.0; // 10 min/km for running, 40 min/km for walking
-    const rawBreaks = [];
-    let inBreak = false; let breakStartIdx = null;
-    for(let i=0;i<pace.length;i++){
-      const p = pace[i];
-      const isBreak = (p!=null && p > breakThreshold) || (p==null);
-      // treat explicit nulls as potential breaks for detection
-      if(isBreak && !inBreak){ inBreak=true; breakStartIdx=i; }
-      if(!isBreak && inBreak){ inBreak=false; rawBreaks.push([breakStartIdx, i-1]); breakStartIdx=null; }
+    const T = 30; // seconds
+    const halfT = T / 2;
+
+    function windowMedianPace(i){
+      const window = [];
+      for(let j=0;j<pace.length;j++){
+        if(pace[j]==null) continue;
+        if(Math.abs(elapsed[i]-elapsed[j]) <= halfT) window.push(pace[j]);
+      }
+      return median(window);
     }
-    if(inBreak && breakStartIdx!=null) rawBreaks.push([breakStartIdx, pace.length-1]);
+    const isCandidate = (i) => {
+      const wm = windowMedianPace(i);
+      return wm == null || wm > breakThreshold;
+    };
 
-    // Typical sampling interval, used to tell a real data gap (missing GPS samples)
-    // apart from a normal-cadence point that just happens to be slow (e.g. a hill).
-    const sortedDt = dtRaw.filter(v => v>0).slice().sort((a,b)=>a-b);
-    const typicalDt = sortedDt.length ? sortedDt[Math.floor(sortedDt.length/2)] : 1;
-    const gapDtThreshold = Math.max(typicalDt * 2.5, typicalDt + 2);
-    // A point counts as "missing data" only if it has no computable distance (duplicate
-    // coordinate) or arrived after an abnormally long gap since the previous sample.
-    // A point recorded at the normal cadence with real, distinct coordinates is genuine
-    // data, even if its pace happens to exceed the break threshold, and must never be
-    // silently overwritten with an interpolated straight line.
-    const isMissingData = (i) => pace[i]==null || dtRaw[i] > gapDtThreshold;
+    const rawSegments = [];
+    let inSeg = false; let segStart = null;
+    for(let i=0;i<pace.length;i++){
+      if(isCandidate(i) && !inSeg){ inSeg=true; segStart=i; }
+      if(!isCandidate(i) && inSeg){ inSeg=false; rawSegments.push([segStart, i-1]); segStart=null; }
+    }
+    if(inSeg && segStart!=null) rawSegments.push([segStart, pace.length-1]);
 
-    // For candidate breaks that are ENTIRELY missing data (duplicate coordinates or a
-    // real GPS gap, i.e. nothing measured), check the pace computed straight across the
-    // gap: if it's reasonable, this was just a brief data hiccup during otherwise-normal
-    // movement, not a real pause, so smooth over it. But if the candidate contains ANY
-    // real, normally-sampled point (distinct coordinates, normal time interval) whose
-    // pace is above the break threshold, that's a genuine measured change in behavior
-    // (e.g. the runner slowed to a walk) -- always keep that as a real break, no matter
-    // what the boundary-to-boundary average pace works out to. Averaging across the
-    // break would otherwise wash out real, sustained walking segments whenever the
-    // faster pace just outside the break pulls the average back under the threshold.
-    for(const b of rawBreaks.slice()){
+    // only segments lasting >= T seconds are even considered as break candidates
+    const longEnough = rawSegments.filter(b => (elapsed[b[1]] - elapsed[b[0]]) >= T);
+
+    const confirmedBreaks = [];
+    for(const b of longEnough){
       const s = b[0], e = b[1];
       const before = s-1, after = e+1;
       const pBefore = (before>=0? pace[before] : null);
       const pAfter = (after<pace.length? pace[after] : null);
 
-      let allMissing = true;
-      for(let j=s;j<=e;j++){ if(!isMissingData(j)){ allMissing = false; break; } }
+      let paceAcross = null;
+      if(before>=0 && after<pace.length){
+        const distKm = cumdist[after] - cumdist[before];
+        const timeSec = elapsed[after] - elapsed[before];
+        if(distKm>0 && timeSec>0){
+          paceAcross = (timeSec / distKm) / 60.0;
+        }
+      }
+      const isRealBreak = paceAcross != null && paceAcross > breakThreshold;
 
-      if(allMissing){
-        let paceAcross = Infinity;
-        if(before >=0 && after < pace.length){
-          const distKm = cumdist[after] - cumdist[before];
-          const timeSec = elapsed[after] - elapsed[before];
-          if(distKm>0 && timeSec>0){
-            paceAcross = (timeSec / (distKm*1000.0)) / 60.0;
-          }
-        }
-        if(paceAcross <= breakThreshold){
-          for(let j=s;j<=e;j++){
-            if(pBefore!=null && pAfter!=null && elapsed[after] > elapsed[before]){
-              const frac = (elapsed[j] - elapsed[before]) / (elapsed[after] - elapsed[before]);
-              pace[j] = pBefore + (pAfter - pBefore) * frac;
-            } else {
-              pace[j] = paceAcross;
-            }
-          }
-          // not a real break: remove it
-          b[0] = -1; b[1] = -1;
-        }
-      } else {
-        // Real, measured slow data is present (e.g. a walk break): keep this as a
-        // genuine break. Only fill in the sub-points that are themselves missing data,
-        // for chart continuity; leave every real measured point exactly as computed.
+      if(isRealBreak){
+        confirmedBreaks.push(b);
+        // fill only the genuinely missing (null) points inside, for chart continuity;
+        // leave every real measured sample exactly as computed.
         for(let j=s;j<=e;j++){
-          if(!isMissingData(j)) continue;
+          if(pace[j]!=null) continue;
           if(pBefore!=null && pAfter!=null && elapsed[after] > elapsed[before]){
             const frac = (elapsed[j] - elapsed[before]) / (elapsed[after] - elapsed[before]);
             pace[j] = pBefore + (pAfter - pBefore) * frac;
@@ -268,13 +261,27 @@
             pace[j] = pAfter;
           }
         }
+      } else {
+        // Didn't hold up to the double-check: not a real break, likely bad/noisy samples
+        // or a brief GPS hiccup. Smooth the whole segment instead of flagging it.
+        for(let j=s;j<=e;j++){
+          if(pBefore!=null && pAfter!=null && elapsed[after] > elapsed[before]){
+            const frac = (elapsed[j] - elapsed[before]) / (elapsed[after] - elapsed[before]);
+            pace[j] = pBefore + (pAfter - pBefore) * frac;
+          } else if(paceAcross!=null){
+            pace[j] = paceAcross;
+          } else if(pBefore!=null){
+            pace[j] = pBefore;
+          } else if(pAfter!=null){
+            pace[j] = pAfter;
+          }
+        }
       }
     }
 
-    // build merged breaks from remaining rawBreaks
-    const remaining = rawBreaks.filter(x => x[0] >= 0);
+    // merge confirmed breaks that are close together (gap <= 60s)
     const breaks = [];
-    for(const b of remaining){
+    for(const b of confirmedBreaks){
       if(breaks.length === 0){ breaks.push(b); }
       else {
         const lastBreak = breaks[breaks.length-1];
@@ -283,15 +290,11 @@
         else { breaks.push(b); }
       }
     }
+    const filteredBreaks = breaks;
 
-    // filter out breaks smaller than 30 seconds
-    const filteredBreaks = breaks.filter(b => (elapsed[b[1]] - elapsed[b[0]]) >= 30);
-
-    // Any remaining null pace values that are NOT inside a real (>=30s) break are just
-    // short, isolated gaps that couldn't be interpolated above (typically a duplicate
-    // coordinate at the very start/end of the recording with no "before" or "after"
-    // point to bridge against). Rather than showing these as missing data, carry the
-    // nearest valid pace value forward/backward into them.
+    // Any remaining null pace values (e.g. at the very start/end of the recording, with
+    // no "before" or "after" point to bridge against) are just isolated gaps. Carry the
+    // nearest valid pace value forward/backward into them so nothing is left null.
     const isInRealBreak = (i) => filteredBreaks.some(b => i >= b[0] && i <= b[1]);
     for(let i=0;i<pace.length;i++){
       if(pace[i]!=null || isInRealBreak(i)) continue;
@@ -350,7 +353,7 @@
       traceMedian = { name:'Median (±30s)', x:times, y:medianDisplay, customdata:coords, mode:'lines', line:{color:COLORS.pace, width:3}, connectgaps:false, hovertemplate:'%{x|%H:%M:%S}<br>Median: %{y:.2f} km/h<br>Lat: %{customdata[0]:.5f} Lon: %{customdata[1]:.5f}<extra></extra>' };
     }
 
-    const traceDist = { name:'Distance (km)', x:times, y:cumdist, customdata:coords, mode:'lines', line:{color:COLORS.dist, width:3}, yaxis:'y2', hovertemplate:'%{x|%H:%M:%S}<br>Distance: %{y:.3f} km<br>Lat: %{customdata[0]:.5f} Lon: %{customdata[1]:.5f}<extra></extra>' };
+    const traceDist = { name:'Distance (km)', x:times, y:cumdist, customdata:coords, mode:'lines', line:{color:COLORS.dist, width:3}, hovertemplate:'%{x|%H:%M:%S}<br>Distance: %{y:.3f} km<br>Lat: %{customdata[0]:.5f} Lon: %{customdata[1]:.5f}<extra></extra>' };
     const traceHR = { name:'Heart rate (bpm)', x:times, y:hr, customdata:coords, mode:'lines', line:{color:COLORS.hr, width:1.5}, yaxis:'y2', hovertemplate:'%{x|%H:%M:%S}<br>HR: %{y} bpm<br>Lat: %{customdata[0]:.5f} Lon: %{customdata[1]:.5f}<extra></extra>' };
 
     // build background shapes for breaks (brighter: 20% increase in alpha)
@@ -389,11 +392,11 @@
         plot_bgcolor:'rgba(0,0,0,0)', paper_bgcolor:'rgba(0,0,0,0)',
         font:{ color: '#e2e4ed', family: 'Inter, system-ui' },
         xaxis:{ title:'Time', gridcolor:'#2a2d3a', tickformat:'%H:%M:%S' },
-        yaxis:{ title:'Pace (min/km)', range:[0,20], gridcolor:'#2a2d3a' },
-        yaxis2:{ title:'Distance (km) / HR (bpm)', overlaying:'y', side:'right', gridcolor:'#2a2d3a', range:[0, 200] },
+        yaxis:{ title:'Pace (min/km) / Distance (km)', range:[0,20], gridcolor:'#2a2d3a' },
+        yaxis2:{ title:'HR (bpm)', overlaying:'y', side:'right', gridcolor:'#2a2d3a', range:[0, 200] },
         shapes: shapes,
-        legend:{ orientation:'h', x:0, y:1.05 },
-        margin:{ l:60, r:80, t:100, b:80 }, height:600,
+        legend:{ orientation:'v', x:0.01, y:0.99, xanchor:'left', yanchor:'top', bgcolor:'rgba(26,29,39,0.75)', bordercolor:'#2a2d3a', borderwidth:1 },
+        margin:{ l:60, r:80, t:40, b:80 }, height:600,
         hoverlabel:{ bgcolor: '#1a1d27', bordercolor: '#6c63ff', font: {color: '#e2e4ed'} }
       };
     } else {
@@ -403,11 +406,10 @@
         plot_bgcolor:'rgba(0,0,0,0)', paper_bgcolor:'rgba(0,0,0,0)',
         font:{ color: '#e2e4ed', family: 'Inter, system-ui' },
         xaxis:{ title:'Time', gridcolor:'#2a2d3a', tickformat:'%H:%M:%S' },
-        yaxis:{ title:'Speed (km/h)', range:[0,10], gridcolor:'#2a2d3a' },
-        yaxis2:{ title:'Distance (km)', overlaying:'y', side:'right', gridcolor:'#2a2d3a' },
+        yaxis:{ title:'Speed (km/h) / Distance (km)', range:[0,10], gridcolor:'#2a2d3a' },
         shapes: shapes,
-        legend:{ orientation:'h', x:0, y:1.05 },
-        margin:{ l:60, r:80, t:100, b:80 }, height:600,
+        legend:{ orientation:'v', x:0.01, y:0.99, xanchor:'left', yanchor:'top', bgcolor:'rgba(26,29,39,0.75)', bordercolor:'#2a2d3a', borderwidth:1 },
+        margin:{ l:60, r:80, t:40, b:80 }, height:600,
         hoverlabel:{ bgcolor: '#1a1d27', bordercolor: '#6c63ff', font: {color: '#e2e4ed'} }
       };
     }
