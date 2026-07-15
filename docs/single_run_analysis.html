@@ -4,6 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Single Run Analysis</title>
+  <link rel="icon" type="image/png" href="logo.png">
   <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -28,7 +29,7 @@
 <body>
   <div class="container">
     <h1 id="title">Single Run Analysis</h1>
-    <div class="muted">Load a GPX file (produced by Strava or from the codebase) to analyze a single run.</div>
+    <div class="muted" id="load-msg">Load a GPX file (produced by Strava or from the codebase) to analyze a single run.</div>
 
     <div id="controls">
       <label for="gpxfile">Load data</label>
@@ -40,6 +41,11 @@
   </div>
 
   <script>
+  // Holds the numeric ID extracted from the loaded GPX filename (e.g. "12345678.gpx" -> "12345678")
+  let currentRunId = null;
+  // Holds the run name from the GPX file's <trk><name> element (e.g. "Short Wednesday")
+  let currentRunName = null;
+
   // Colors matching existing theme
   const COLORS = {
     dist: '#2ecc71',      // green
@@ -71,6 +77,13 @@
     if(!a.length) return null;
     const mid = Math.floor(a.length/2);
     return a.length%2 ? a[mid] : (a[mid-1]+a[mid])/2;
+  }
+
+  function extractGPXName(gpxText){
+    const parser = new DOMParser();
+    const xml = parser.parseFromString(gpxText, 'application/xml');
+    const nameNodes = xml.getElementsByTagName('name');
+    return nameNodes.length ? nameNodes[0].textContent.trim() : null;
   }
 
   function parseGPXText(gpxText){
@@ -350,10 +363,16 @@
     // Format title
     const distanceStr = Math.round(totalDistKm * 1000).toLocaleString() + ' m';
     const paceStr = avgPaceMinPerKm ? (Math.floor(avgPaceMinPerKm)+':'+String(Math.round((avgPaceMinPerKm%1)*60)).padStart(2,'0')+' min/km') : '';
+    const namePrefix = currentRunName ? `${currentRunName} | ` : '';
     const titleText = isRunning ?
-      `Total  ${secondsToHMS(totalTimeSec)}  ${distanceStr}  ${paceStr}` :
-      `Total  ${secondsToHMS(totalTimeSec)}  ${distanceStr}`;
+      `${namePrefix}Total ${secondsToHMS(totalTimeSec)} | ${distanceStr} | ${paceStr}` :
+      `${namePrefix}Total ${secondsToHMS(totalTimeSec)} | ${distanceStr}`;
     document.getElementById('title').textContent = titleText;
+    document.title = currentRunName ? `Single Run Analysis - ${currentRunName}` : 'Single Run Analysis';
+
+    // Replace the initial "load a file" instructions with the activity number once data is loaded
+    const loadMsgEl = document.getElementById('load-msg');
+    if(loadMsgEl) loadMsgEl.textContent = currentRunId ? `#${currentRunId}` : '';
 
     // Format info line with date, start time, activity number (using times[0])
     const startTime = times[0];
@@ -399,10 +418,14 @@
   document.getElementById('gpxfile').addEventListener('change', (ev) => {
     const f = ev.target.files[0];
     if(!f) return;
+    const idMatch = f.name.match(/\d+/);
+    currentRunId = idMatch ? idMatch[0] : null;
     const reader = new FileReader();
     reader.onload = function(e){
       try{
-        const pts = parseGPXText(e.target.result);
+        const gpxText = e.target.result;
+        currentRunName = extractGPXName(gpxText);
+        const pts = parseGPXText(gpxText);
         const data = buildFromPoints(pts);
         if(!data) { alert('No time points found in GPX.'); return; }
         drawChart(data);
