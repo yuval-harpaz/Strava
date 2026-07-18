@@ -5,7 +5,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Single Run Analysis</title>
   <link rel="icon" type="image/png" href="logo.png">
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="" />
   <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     :root {
@@ -21,6 +23,9 @@
     .muted { color:var(--muted); margin-bottom:12px }
     #controls { margin-bottom:12px }
     #chart-container { background: var(--surface); border:1px solid var(--border); border-radius:6px; padding:12px }
+    #map-container { margin-top:16px; background: var(--surface); border:1px solid var(--border); border-radius:6px; padding:12px }
+    #map-title { font-size:14px; color:var(--muted); margin-bottom:10px }
+    #map { height:420px; border-radius:6px; overflow:hidden }
     .info { margin-top:8px; color:var(--muted) }
     button, label { background:transparent; color:var(--text); border:1px solid var(--border); padding:8px 10px; border-radius:6px; cursor:pointer }
     input[type=file] { display:none }
@@ -38,6 +43,10 @@
     </div>
 
     <div id="chart-container"><div id="chart" style="height:600px"></div></div>
+    <div id="map-container">
+      <div id="map-title">Course map</div>
+      <div id="map"></div>
+    </div>
   </div>
 
   <script>
@@ -45,6 +54,12 @@
   let currentRunId = null;
   // Holds the run name from the GPX file's <trk><name> element (e.g. "Short Wednesday")
   let currentRunName = null;
+  let leafletMap = null;
+  let routeLayer = null;
+  let hoverMarker = null;
+  let startMarker = null;
+  let endMarker = null;
+  let chartEventsBound = false;
 
   // Colors matching existing theme
   const COLORS = {
@@ -53,6 +68,76 @@
     pace: '#f1c40f',      // yellow
     median: '#9b59b6'     // purple
   };
+
+  function ensureMap(){
+    if(leafletMap) return leafletMap;
+    leafletMap = L.map('map', { zoomControl: true, attributionControl: true });
+    const googleHyb = L.tileLayer('https://{s}.google.com/vt/lyrs=s,h&x={x}&y={y}&z={z}', {
+      maxZoom: 21,
+      subdomains: ['mt0', 'mt1', 'mt2', 'mt3'],
+      attribution: 'Map data © Google'
+    });
+    googleHyb.addTo(leafletMap);
+    routeLayer = L.polyline([], { color: COLORS.dist, weight: 4, opacity: 0.95 }).addTo(leafletMap);
+    startMarker = L.circleMarker([0,0], { radius: 5, color: '#ffffff', weight: 2, fillColor: COLORS.dist, fillOpacity: 1 });
+    endMarker = L.circleMarker([0,0], { radius: 5, color: '#ffffff', weight: 2, fillColor: COLORS.pace, fillOpacity: 1 });
+    hoverMarker = L.circleMarker([0,0], { radius: 7, color: '#ffffff', weight: 2, fillColor: COLORS.hr, fillOpacity: 1 });
+    return leafletMap;
+  }
+
+  function updateMap(data){
+    const map = ensureMap();
+    const latlngs = data.latArr
+      .map((lat, i) => (lat != null && data.lonArr[i] != null ? [lat, data.lonArr[i]] : null))
+      .filter(Boolean);
+    routeLayer.setLatLngs(latlngs);
+    if(latlngs.length){
+      startMarker.setLatLng(latlngs[0]).addTo(map).bindTooltip('Start', { permanent:false, direction:'top' });
+      endMarker.setLatLng(latlngs[latlngs.length-1]).addTo(map).bindTooltip('Finish', { permanent:false, direction:'top' });
+      hoverMarker.setLatLng(latlngs[0]);
+      if(map.getZoom() == null || !map.getBounds().isValid()){
+        map.fitBounds(routeLayer.getBounds(), { padding:[20,20] });
+      } else {
+        map.fitBounds(routeLayer.getBounds(), { padding:[20,20] });
+      }
+    }
+    if(map.hasLayer(hoverMarker)) map.removeLayer(hoverMarker);
+    setTimeout(() => map.invalidateSize(), 0);
+  }
+
+  function setMapHoverPoint(data, idx){
+    if(!leafletMap || idx == null || idx < 0 || idx >= data.latArr.length) return;
+    const lat = data.latArr[idx];
+    const lon = data.lonArr[idx];
+    if(lat == null || lon == null) return;
+    hoverMarker.setLatLng([lat, lon]);
+    if(!leafletMap.hasLayer(hoverMarker)) hoverMarker.addTo(leafletMap);
+  }
+
+  function clearMapHoverPoint(){
+    if(leafletMap && hoverMarker && leafletMap.hasLayer(hoverMarker)) leafletMap.removeLayer(hoverMarker);
+  }
+
+  function bindChartMapSync(data){
+    const chartEl = document.getElementById('chart');
+    if(chartEventsBound){
+      chartEl.removeAllListeners('plotly_hover');
+      chartEl.removeAllListeners('plotly_unhover');
+      chartEl.removeAllListeners('plotly_doubleclick');
+    }
+    chartEl.on('plotly_hover', (ev) => {
+      const point = ev && ev.points && ev.points.length ? ev.points[0] : null;
+      if(!point || point.pointNumber == null) return;
+      setMapHoverPoint(data, point.pointNumber);
+    });
+    chartEl.on('plotly_unhover', () => {
+      clearMapHoverPoint();
+    });
+    chartEl.on('plotly_doubleclick', () => {
+      clearMapHoverPoint();
+    });
+    chartEventsBound = true;
+  }
 
   // Haversine distance in meters
   function haversine(lat1, lon1, lat2, lon2) {
@@ -559,7 +644,10 @@
       };
     }
 
-    Plotly.react('chart', traces, layout, {responsive:true});
+    Plotly.react('chart', traces, layout, {responsive:true}).then(() => {
+      updateMap(data);
+      bindChartMapSync(data);
+    });
   }
 
   document.getElementById('gpxfile').addEventListener('change', (ev) => {
