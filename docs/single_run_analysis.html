@@ -95,6 +95,10 @@
       const lon = parseFloat(node.getAttribute('lon'));
       const timeNode = node.getElementsByTagName('time')[0];
       const time = timeNode ? new Date(timeNode.textContent) : null;
+      // elevation (meters)
+      let ele = null;
+      const eleN = node.getElementsByTagName('ele');
+      if(eleN && eleN.length) ele = parseFloat(eleN[0].textContent);
       // Try HR in known extension namespaces
       let hr = null;
       const hrs = node.getElementsByTagName('gpxtpx:hr');
@@ -104,7 +108,7 @@
         const hr2 = node.getElementsByTagName('hr');
         if(hr2 && hr2.length) hr = parseInt(hr2[0].textContent);
       }
-      return { lat, lon, time, hr };
+      return { lat, lon, time, hr, ele };
     }).filter(p => p.time !== null);
     return pts;
   }
@@ -122,6 +126,7 @@
     let totalDistM = 0;
     const latArr = [];
     const lonArr = [];
+    const eleArr = [];
     const dtRaw = [0]; // seconds since previous sample, per point (used to detect real data gaps)
     // Tracks the index of the last point whose position actually differed from its
     // predecessor (i.e. the last confirmed "moved" point). Used so that pace after a
@@ -140,6 +145,7 @@
       hr.push(p.hr != null ? p.hr : null);
       latArr.push(p.lat);
       lonArr.push(p.lon);
+      eleArr.push(p.ele != null ? p.ele : null);
       if(i===0) { cumdist.push(0); pace.push(null); }
       else {
         const prev = points[i-1];
@@ -331,6 +337,34 @@
     const medianPace = median(tempMedianWindow2);
     const isRunning = medianPace != null && medianPace < 8.0;
 
+    // For walking only: smooth the pace time-series with a centered 10s window (±5s)
+    // before computing the displayed median (±30s). This reduces jitter in the
+    // median trace for slow walks where instantaneous pace is noisy.
+    if(!isRunning){
+      const pfm = paceForMedian;
+      const smoothed = pfm.map((_,i) => {
+        const window = [];
+        for(let j=0;j<pfm.length;j++){
+          if(pfm[j]==null) continue;
+          if(Math.abs(elapsed[i]-elapsed[j]) <= 5) window.push(pfm[j]);
+        }
+        return window.length ? window.reduce((a,b)=>a+b,0)/window.length : null;
+      });
+      // recompute median1min using the smoothed pace series
+      median1min.length = 0;
+      tempMedianWindow2.length = 0;
+      for(let i=0;i<elapsed.length;i++){
+        const window = [];
+        for(let j=0;j<smoothed.length;j++){
+          if(smoothed[j]==null) continue;
+          if(Math.abs(elapsed[i]-elapsed[j])<=30) window.push(smoothed[j]);
+        }
+        const mv = median(window);
+        median1min.push(mv);
+        if(mv!=null) tempMedianWindow2.push(mv);
+      }
+    }
+
     // A genuine raw sampling gap (the recording device didn't log anything for a while,
     // e.g. an auto-pause dropout) has no data at all in between -- connecting the two
     // flanking points with a straight line implies a smooth trend that was never measured.
@@ -356,6 +390,9 @@
       median1min.splice(i,0,null);
       latArr.splice(i,0,midLat);
       lonArr.splice(i,0,midLon);
+      // interpolate elevation for the inserted midpoint if available
+      const midEle = (eleArr[i-1] != null && eleArr[i] != null) ? (eleArr[i-1] + eleArr[i]) / 2 : null;
+      eleArr.splice(i,0,midEle);
       // shift break index ranges to account for the newly-inserted row
       for(const b of filteredBreaks){
         if(b[0] >= i) b[0] += 1;
@@ -363,11 +400,11 @@
       }
     }
 
-    return { times, elapsed, cumdist, hr, pace, median1min, totalTimeSec, totalDistKm, avgPaceMinPerKm, breaks: filteredBreaks, isRunning, medianPace, latArr, lonArr };
+    return { times, elapsed, cumdist, hr, pace, median1min, totalTimeSec, totalDistKm, avgPaceMinPerKm, breaks: filteredBreaks, isRunning, medianPace, latArr, lonArr, eleArr };
   }
 
   function drawChart(data){
-    const { times, cumdist, hr, pace, median1min, totalTimeSec, totalDistKm, avgPaceMinPerKm, breaks, isRunning, latArr, lonArr } = data;
+    const { times, cumdist, hr, pace, median1min, totalTimeSec, totalDistKm, avgPaceMinPerKm, breaks, isRunning, latArr, lonArr, eleArr } = data;
 
     // Hide the median line during breaks (it's not meaningful across a break), but
     // keep the raw per-point pace markers visible everywhere, including during breaks.
@@ -381,21 +418,40 @@
     // coords for hover
     const coords = times.map((_,i) => (latArr && lonArr ? [latArr[i], lonArr[i]] : [null, null]));
 
+    // Calculate min/max elevation for rescaling display and ytick labels
+    const validEle = eleArr.filter(e => e != null);
+    const minEle = validEle.length ? Math.min(...validEle) : 0;
+    const maxEle = validEle.length ? Math.max(...validEle) : 200;
+    const eleRange = maxEle - minEle;
+    // Rescale elevation to 0-200 for display (fills the axis)
+    const eleScaled = eleArr.map(e =>
+      e != null ? (e - minEle) / eleRange * 200 : null
+    );
+    // Create customdata that includes original elevation for hover
+    const coordsWithEle = times.map((_,i) => [
+      latArr && lonArr ? [latArr[i], lonArr[i]] : [null, null],
+      eleArr[i]
+    ]);
+
     // For walking, convert pace (min/km) to speed (km/h)
     const paceDisplay = isRunning ? pace : pace.map(p => p != null ? 60.0 / p : null);
     const medianDisplay = isRunning ? medianVisible : medianVisible.map(p => p != null ? 60.0 / p : null);
 
     let tracePace, traceMedian, traceRaw;
     if(isRunning){
-      traceRaw = { name:'', x:times, y:pace, customdata:coords, mode:'markers', marker:{color:COLORS.pace, size:4, opacity:0.6}, hovertemplate:'%{x|%H:%M:%S}<br>Pace: %{y:.2f} min/km<br>Lat: %{customdata[0]:.5f} Lon: %{customdata[1]:.5f}<extra></extra>', showlegend:false };
-      traceMedian = { name:'Median (±30s)', x:times, y:medianDisplay, customdata:coords, mode:'lines', line:{color:COLORS.pace, width:3}, connectgaps:false, hovertemplate:'%{x|%H:%M:%S}<br>Median: %{y:.2f} min/km<br>Lat: %{customdata[0]:.5f} Lon: %{customdata[1]:.5f}<extra></extra>' };
+      traceRaw = { name:'', x:times, y:pace, customdata:coords, mode:'markers', marker:{color:COLORS.pace, size:1, opacity:0.8}, hovertemplate:'%{x|%H:%M:%S}<br>Pace: %{y:.2f} min/km<br>Lat: %{customdata[0]:.5f} Lon: %{customdata[1]:.5f}<extra></extra>', showlegend:false };
+      traceMedian = { name:'pace (median ±30s)', x:times, y:medianDisplay, customdata:coords, mode:'lines', line:{color:COLORS.pace, width:3}, connectgaps:false, hovertemplate:'%{x|%H:%M:%S}<br>Median: %{y:.2f} min/km<br>Lat: %{customdata[0]:.5f} Lon: %{customdata[1]:.5f}<extra></extra>' };
     } else {
-      traceRaw = { name:'', x:times, y:paceDisplay, customdata:coords, mode:'markers', marker:{color:COLORS.pace, size:4, opacity:0.6}, hovertemplate:'%{x|%H:%M:%S}<br>Speed: %{y:.2f} km/h<br>Lat: %{customdata[0]:.5f} Lon: %{customdata[1]:.5f}<extra></extra>', showlegend:false };
-      traceMedian = { name:'Median (±30s)', x:times, y:medianDisplay, customdata:coords, mode:'lines', line:{color:COLORS.pace, width:3}, connectgaps:false, hovertemplate:'%{x|%H:%M:%S}<br>Median: %{y:.2f} km/h<br>Lat: %{customdata[0]:.5f} Lon: %{customdata[1]:.5f}<extra></extra>' };
+      traceRaw = { name:'', x:times, y:paceDisplay, customdata:coords, mode:'markers', marker:{color:COLORS.pace, size:1, opacity:0.8}, hovertemplate:'%{x|%H:%M:%S}<br>Speed: %{y:.2f} km/h<br>Lat: %{customdata[0]:.5f} Lon: %{customdata[1]:.5f}<extra></extra>', showlegend:false };
+      traceMedian = { name:'speed (median ±30s)', x:times, y:medianDisplay, customdata:coords, mode:'lines', line:{color:COLORS.pace, width:3}, connectgaps:false, hovertemplate:'%{x|%H:%M:%S}<br>Median: %{y:.2f} km/h<br>Lat: %{customdata[0]:.5f} Lon: %{customdata[1]:.5f}<extra></extra>' };
     }
 
     const traceDist = { name:'Distance (km)', x:times, y:cumdist, customdata:coords, mode:'lines', line:{color:COLORS.dist, width:3}, hovertemplate:'%{x|%H:%M:%S}<br>Distance: %{y:.3f} km<br>Lat: %{customdata[0]:.5f} Lon: %{customdata[1]:.5f}<extra></extra>' };
-    const traceHR = { name:'Heart rate (bpm)', x:times, y:hr, customdata:coords, mode:'lines', line:{color:COLORS.hr, width:1.5}, yaxis:'y2', hovertemplate:'%{x|%H:%M:%S}<br>HR: %{y} bpm<br>Lat: %{customdata[0]:.5f} Lon: %{customdata[1]:.5f}<extra></extra>' };
+    // HR will use a separate right-side axis (y3). Elevation is plotted as a brown area on y2.
+    const traceHR = { name:'Heart rate (bpm)', x:times, y:hr, customdata:coords, mode:'lines', line:{color:COLORS.hr, width:1.5}, yaxis:'y3', hovertemplate:'%{x|%H:%M:%S}<br>HR: %{y} bpm<br>Lat: %{customdata[0]:.5f} Lon: %{customdata[1]:.5f}<extra></extra>' };
+
+    // elevation area (brown) plotted on right y-axis (y2)
+    const traceEle = { name: 'Elevation (m)', x: times, y: eleScaled, customdata: coordsWithEle, fill: 'tozeroy', fillcolor: 'rgba(139,69,19,0.25)', line: {color: 'rgba(0,0,0,0)' }, yaxis: 'y2', hovertemplate:'%{x|%H:%M:%S}<br>Elevation: %{customdata[1]:.1f} m<extra></extra>', showlegend:true };
 
     // build background shapes for breaks (brighter: 20% increase in alpha)
     const shapes = breaks.map(b => {
@@ -403,6 +459,23 @@
       const x1 = times[b[1]];
       return { type:'rect', xref:'x', yref:'paper', x0:x0, x1:x1, y0:0, y1:1, fillcolor:'rgba(155,89,182,0.28)', line:{width:0} };
     });
+
+    // Legend-only trace for break entry: use an opaque swatch so it's visible on dark backgrounds.
+    const traceBreakLegend = {
+      name: 'Break',
+      x: [times[0]],
+      y: [0],
+      mode: 'markers',
+      marker: {
+        color: 'rgba(155,89,182,0.95)',
+        size: 11,
+        symbol: 'square',
+        line: { color: 'rgba(226,228,237,0.7)', width: 1 }
+      },
+      visible: 'legendonly',
+      hoverinfo: 'skip',
+      showlegend: true
+    };
 
     // Format title
     const distanceStr = Math.round(totalDistKm * 1000).toLocaleString() + ' m';
@@ -427,30 +500,36 @@
 
     let traces, layout;
     if(isRunning){
-      traces = [traceRaw, traceMedian, traceDist, traceHR];
+       // elevation behind others, HR included on a separate right axis (y3)
+       traces = [traceEle, traceRaw, traceMedian, traceDist, traceHR, traceBreakLegend];
       layout = {
         hovermode:'closest',
         plot_bgcolor:'rgba(0,0,0,0)', paper_bgcolor:'rgba(0,0,0,0)',
         font:{ color: '#e2e4ed', family: 'Inter, system-ui' },
         xaxis:{ title:'Time', gridcolor:'#2a2d3a', tickformat:'%H:%M:%S' },
         yaxis:{ title:'Pace (min/km) / Distance (km)', range:[0,20], gridcolor:'#2a2d3a' },
-        yaxis2:{ title:'HR (bpm)', overlaying:'y', side:'right', gridcolor:'#2a2d3a', range:[0, 200] },
+        // elevation on the right axis (0..200), no grid, show only ticks at 0 and 200
+        yaxis2:{ overlaying:'y', side:'right', range:[0,200], showgrid:false, tickmode:'array', tickvals:[0,200], ticktext:[Math.round(minEle)+' m', Math.round(maxEle)+' m'], tickfont:{color:'#8B4513'} },
+         // HR on a separate right axis, show ticks at 50, 100, 150 to avoid hiding elevation ticks at 0 and 200
+         yaxis3:{ title:'HR (bpm)', overlaying:'y', side:'right', anchor:'x', position:0.95, gridcolor:'#2a2d3a', range:[0, 200], tickmode:'array', tickvals:[50, 100, 150] },
         shapes: shapes,
         legend:{ orientation:'v', x:0.01, y:0.99, xanchor:'left', yanchor:'top', bgcolor:'rgba(26,29,39,0.75)', bordercolor:'#2a2d3a', borderwidth:1 },
-        margin:{ l:60, r:80, t:40, b:80 }, height:600,
+        margin:{ l:60, r:120, t:40, b:80 }, height:600,
         hoverlabel:{ bgcolor: '#1a1d27', bordercolor: '#6c63ff', font: {color: '#e2e4ed'} }
       };
     } else {
-      traces = [traceRaw, traceMedian, traceDist];
+       // walking: elevation shown on right axis, HR not included by default
+       traces = [traceEle, traceRaw, traceMedian, traceDist, traceBreakLegend];
       layout = {
         hovermode:'closest',
         plot_bgcolor:'rgba(0,0,0,0)', paper_bgcolor:'rgba(0,0,0,0)',
         font:{ color: '#e2e4ed', family: 'Inter, system-ui' },
         xaxis:{ title:'Time', gridcolor:'#2a2d3a', tickformat:'%H:%M:%S' },
-        yaxis:{ title:'Speed (km/h) / Distance (km)', range:[0,10], gridcolor:'#2a2d3a' },
+         yaxis:{ title:'Speed (km/h) / Distance (km)', range:[0,10], gridcolor:'#2a2d3a' },
+         yaxis2:{ overlaying:'y', side:'right', range:[0,200], showgrid:false, tickmode:'array', tickvals:[0,200], ticktext:[Math.round(minEle)+' m', Math.round(maxEle)+' m'], tickfont:{color:'#8B4513'} },
         shapes: shapes,
         legend:{ orientation:'v', x:0.01, y:0.99, xanchor:'left', yanchor:'top', bgcolor:'rgba(26,29,39,0.75)', bordercolor:'#2a2d3a', borderwidth:1 },
-        margin:{ l:60, r:80, t:40, b:80 }, height:600,
+        margin:{ l:60, r:100, t:40, b:80 }, height:600,
         hoverlabel:{ bgcolor: '#1a1d27', bordercolor: '#6c63ff', font: {color: '#e2e4ed'} }
       };
     }
