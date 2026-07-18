@@ -447,8 +447,10 @@
     }
 
     const traceDist = { name:'Distance (km)', x:times, y:cumdist, customdata:coords, mode:'lines', line:{color:COLORS.dist, width:3}, hovertemplate:'%{x|%H:%M:%S}<br>Distance: %{y:.3f} km<br>Lat: %{customdata[0]:.5f} Lon: %{customdata[1]:.5f}<extra></extra>' };
+    const hasHeartRate = hr.some(v => v != null);
     // HR will use a separate right-side axis (y3). Elevation is plotted as a brown area on y2.
     const traceHR = { name:'Heart rate (bpm)', x:times, y:hr, customdata:coords, mode:'lines', line:{color:COLORS.hr, width:1.5}, yaxis:'y3', hovertemplate:'%{x|%H:%M:%S}<br>HR: %{y} bpm<br>Lat: %{customdata[0]:.5f} Lon: %{customdata[1]:.5f}<extra></extra>' };
+    const traceHR170 = { name:'', x:times, y:times.map(() => 170), mode:'lines', line:{color:COLORS.hr, width:1.5, dash:'dash'}, yaxis:'y3', hoverinfo:'skip', showlegend:false };
 
     // elevation area (brown) plotted on right y-axis (y2)
     const traceEle = { name: 'Elevation (m)', x: times, y: eleScaled, customdata: coordsWithEle, fill: 'tozeroy', fillcolor: 'rgba(139,69,19,0.25)', line: {color: 'rgba(0,0,0,0)' }, yaxis: 'y2', hovertemplate:'%{x|%H:%M:%S}<br>Elevation: %{customdata[1]:.1f} m<extra></extra>', showlegend:true };
@@ -498,21 +500,43 @@
     const activityTypeStr = isRunning ? 'Running' : 'Walking';
     document.getElementById('breaks-info').textContent = `${dateStr} ${timeStr} ${activityTypeStr} (${breaks.length} break(s))`;
 
+    // Build km milestone annotations for fully reached whole kilometers only.
+    const xTickFontSize = 12;
+    const annotations = [];
+    const maxDist = Math.floor(totalDistKm);
+    for(let km=1; km<=maxDist; km++){
+      const reachedIdx = cumdist.findIndex(d => d >= km);
+      if(reachedIdx === -1) continue;
+      annotations.push({
+        x: times[reachedIdx],
+        y: 0.015,
+        xref: 'x',
+        yref: 'paper',
+        text: km + 'km',
+        showarrow: false,
+        textangle: 90,
+        font: { color: '#2ecc71', size: xTickFontSize },
+        xanchor: 'center',
+        yanchor: 'bottom'
+      });
+    }
+
     let traces, layout;
     if(isRunning){
        // elevation behind others, HR included on a separate right axis (y3)
-       traces = [traceEle, traceRaw, traceMedian, traceDist, traceHR, traceBreakLegend];
+       traces = [traceEle, traceRaw, traceMedian, traceDist, ...(hasHeartRate ? [traceHR170, traceHR] : []), traceBreakLegend];
       layout = {
         hovermode:'closest',
         plot_bgcolor:'rgba(0,0,0,0)', paper_bgcolor:'rgba(0,0,0,0)',
         font:{ color: '#e2e4ed', family: 'Inter, system-ui' },
-        xaxis:{ title:'Time', gridcolor:'#2a2d3a', tickformat:'%H:%M:%S' },
+        xaxis:{ title:'Time', gridcolor:'#2a2d3a', tickformat:'%H:%M:%S', tickfont:{ size:xTickFontSize } },
         yaxis:{ title:'Pace (min/km) / Distance (km)', range:[0,20], gridcolor:'#2a2d3a' },
         // elevation on the right axis (0..200), no grid, show only ticks at 0 and 200
         yaxis2:{ overlaying:'y', side:'right', range:[0,200], showgrid:false, tickmode:'array', tickvals:[0,200], ticktext:[Math.round(minEle)+' m', Math.round(maxEle)+' m'], tickfont:{color:'#8B4513'} },
-         // HR on a separate right axis, show ticks at 50, 100, 150 to avoid hiding elevation ticks at 0 and 200
-         yaxis3:{ title:'HR (bpm)', overlaying:'y', side:'right', anchor:'x', position:0.95, gridcolor:'#2a2d3a', range:[0, 200], tickmode:'array', tickvals:[50, 100, 150] },
+         // HR on a separate right axis, include a highlighted 170 bpm tick.
+         yaxis3:{ title:'HR (bpm)', overlaying:'y', side:'right', anchor:'x', position:0.95, gridcolor:'#2a2d3a', range:[0, 200], tickmode:'array', tickvals:[50, 100, 150, 170], ticktext:['50', '100', '150', '<span style="color:#e74c3c">170</span>'] },
         shapes: shapes,
+        annotations: annotations,
         legend:{ orientation:'v', x:0.01, y:0.99, xanchor:'left', yanchor:'top', bgcolor:'rgba(26,29,39,0.75)', bordercolor:'#2a2d3a', borderwidth:1 },
         margin:{ l:60, r:120, t:40, b:80 }, height:600,
         hoverlabel:{ bgcolor: '#1a1d27', bordercolor: '#6c63ff', font: {color: '#e2e4ed'} }
@@ -524,10 +548,11 @@
         hovermode:'closest',
         plot_bgcolor:'rgba(0,0,0,0)', paper_bgcolor:'rgba(0,0,0,0)',
         font:{ color: '#e2e4ed', family: 'Inter, system-ui' },
-        xaxis:{ title:'Time', gridcolor:'#2a2d3a', tickformat:'%H:%M:%S' },
+        xaxis:{ title:'Time', gridcolor:'#2a2d3a', tickformat:'%H:%M:%S', tickfont:{ size:xTickFontSize } },
          yaxis:{ title:'Speed (km/h) / Distance (km)', range:[0,10], gridcolor:'#2a2d3a' },
          yaxis2:{ overlaying:'y', side:'right', range:[0,200], showgrid:false, tickmode:'array', tickvals:[0,200], ticktext:[Math.round(minEle)+' m', Math.round(maxEle)+' m'], tickfont:{color:'#8B4513'} },
         shapes: shapes,
+        annotations: annotations,
         legend:{ orientation:'v', x:0.01, y:0.99, xanchor:'left', yanchor:'top', bgcolor:'rgba(26,29,39,0.75)', bordercolor:'#2a2d3a', borderwidth:1 },
         margin:{ l:60, r:100, t:40, b:80 }, height:600,
         hoverlabel:{ bgcolor: '#1a1d27', bordercolor: '#6c63ff', font: {color: '#e2e4ed'} }
